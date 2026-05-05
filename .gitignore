@@ -7,4 +7,6 @@ __pycache__/
 dist/
 build/
 data/
-test*
+test.txt
+outputs/
+slurm_*
