@@ -1,0 +1,13 @@
+# Core ETL
+pandas>=2.0
+numpy>=1.24
+pyarrow>=14
+pyyaml>=6
+
+# Training / generative model
+torch>=2.1
+
+# Dev
+pytest>=7.4
+ruff>=0.3
+pyyaml>=6

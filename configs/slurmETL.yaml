@@ -1,0 +1,74 @@
+paths:
+  gpu_traces: supercloud_power/data/i/gpu_traces.csv
+  intermediate: supercloud_power/data/i/slurm_log.parquet
+  source: supercloud_power/data/r/slurm-log.csv
+  plot: supercloud_power/data/i/plot/slurm_plots.png
+  corr: supercloud_power/data/i/plot/slurm_corr_heatmap.png
+
+source:
+  slurm_usecols:
+    - id_job
+    - cpus_req
+    - mem_req
+    - priority
+    # - nodes_alloc
+    - state
+    - job_type
+    - time_start
+    # - time_end
+  slurm_rename:
+    id_job: job_id
+    # nodes_alloc: nodes_req
+
+  gpu_usecols:
+    - job_id
+    - file_path
+    - nodes_used
+    - duration_sec
+    - length
+  
+  gpu_rename:
+    nodes_used: nodes_req
+
+parquet:
+  compression: "zstd"
+
+processing:
+  random_state: 42
+  keep_states: [3, 4, 5, 6, 11]
+  mem_unlimited_threshold: 1e9
+  qt_mem_quantiles: 500
+  qt_cpus_quantiles: 200
+  qt_dur_quantiles: 1000
+  qt_priority_quantiles: 500
+  nodes_req_log_denominator: 8.0
+  priority_tier_thresholds: [11000, 20000]
+
+  priority_prefix: ptier
+  type_prefix: type
+  type_categories: [batch, interactive, map, other]
+  state_prefix: state
+
+  cyclical_periods:
+    hour: 24
+    dow: 7
+    dom: 31
+  
+  feature_drop_columns:
+    # - job_id
+    # - nodes_req
+    # - duration_sec
+    - time_start
+    # - time_end
+    - mem_req
+    - cpus_req
+    - priority
+    - priority_tier_raw
+    - job_type
+    - state
+
+  job_type_map:
+    "LLMAPREDUCE:MAP": "map"
+    "LLSUB:BATCH": "batch"
+    "LLSUB:INTERACTIVE": "interactive"
+    "OTHER": "other"

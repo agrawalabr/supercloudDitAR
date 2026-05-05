@@ -1,0 +1,44 @@
+paths:
+  source: "supercloud_power/data/r/gpu"
+  intermediate: "supercloud_power/data/i/gpu"
+  gpu_traces: "supercloud_power/data/i/gpu_traces.csv"
+
+source:
+  glob_pattern: "*/*.csv"
+
+columns:
+  timestamp: "timestamp"
+  metrics:
+    - source: "utilization_gpu_pct"
+      output: "gpu_used_pct"
+      cross_node_agg: "mean"
+    - source: "utilization_memory_pct"
+      output: "memory_used_pct"
+      cross_node_agg: "mean"
+    - source: "memory_used_MiB"
+      output: "memory_used_MiB"
+      cross_node_agg: "sum"
+    - source: "power_draw_W"
+      output: "power_draw_W"
+      cross_node_agg: "sum"
+
+resample:
+  within_bin_agg: "mean"
+
+processing:
+  delta_t_seconds: 0.103                  
+  reserved_cpus: 2
+  max_workers: null
+  filename_pattern: "(?P<job_id>\\d+)-(?P<node_id>.+)"
+  delta_t_min: 0.001             
+  delta_t_max: 0.300           
+  outlier_probe_rows: 50
+  min_node_keep_ratio: 0.75
+  upper_bound_sec: 864000
+  lower_bound_sec: 300
+
+parquet:
+  compression: "zstd"
+  row_group_size: 65536
+  filename_template: "{job_id}.parquet"
+  skip_if_min_bytes: 256
