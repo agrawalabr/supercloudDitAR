@@ -1,0 +1,114 @@
+# SeqETL — supercloud_power/configs/seqETL.yaml
+#
+# Builds fixed-shape sliding-window training chunks for DiT-AR v5 from:
+#   - GPU parquets produced by gpuETL (per-job 4-channel telemetry)
+#   - SLURM features parquet produced by slurmETL (per-job 24-dim cond)
+#
+# Output layout:
+#   data/seq/npy/{job_id}.npy             (4, T) float32, normalized
+#   data/seq/train_chunks.parquet         per-chunk index for train
+#   data/seq/test_chunks.parquet          per-chunk index for test
+#   data/seq/norm_stats.npz               mean/std for log1p-z-scored channels
+#   data/seq/seq-etl-report.txt           run report
+
+paths:
+  slurm_features: "supercloud_power/data/i/slurm_log.parquet"
+  gpu_traces:     "supercloud_power/data/i/gpu_traces.csv"
+  npy_dir:        "supercloud_power/data/seq/npy"
+  train_chunks:   "supercloud_power/data/seq/train_chunks.parquet"
+  test_chunks:    "supercloud_power/data/seq/test_chunks.parquet"
+  norm_stats:     "supercloud_power/data/seq/norm_stats.npz"
+  report:         "supercloud_power/data/seq/seq-etl-report.txt"
+
+# ── Channels (ORDER IS LOAD-BEARING — model expects this exact ordering) ──────
+# Channel index 0..2 are the auxiliary channels (used as conditioning).
+# Channel index 3 is the diffusion target.
+channels:
+  - name: gpu_used_pct
+    norm: linear_pct          # (x/100) * 2 - 1
+  - name: memory_used_pct
+    norm: linear_pct          # (x/100) * 2 - 1
+  - name: memory_used_MiB
+    norm: log1p_zscore        # log1p(x) then z-score using global train stats
+  - name: power_draw_W
+    norm: log1p_zscore        # log1p(x) then z-score using global train stats
+
+# ── Sliding window parameters ────────────────────────────────────────────────
+# Native bin width is 103 ms (from gpuETL).
+#   W_ctx  = 2048 bins ≈ 211 s past context
+#   W_pred = 1024 bins ≈ 105 s prediction horizon
+#   stride = 1024 bins (NO overlap; each bin generated exactly once at inference)
+# At inference, n_windows = ceil(job_len / stride). First window has zero ctx.
+sequence:
+  W_ctx:  2048
+  W_pred: 1024
+  stride: 1024
+  # Patch size used by the model (informational here; model.py duplicates it).
+  patch_size: 16
+
+# ── Normalization fit ────────────────────────────────────────────────────────
+normalization:
+  clip_range: [-10.0, 10.0]   # post-z-score clip to bound rare outliers
+  min_std:    1.0e-6          # prevent /0 in degenerate channels
+  # If null, use all train jobs. Set < 1.0 to subsample for faster stats fit.
+  stats_sample_frac: null
+
+# ── Train / test split (job-level; no val set per user spec) ─────────────────
+split:
+  test_frac: 0.10
+  seed:      42
+  # Stratify on the cross-product of these binary columns. Each cell of the
+  # cross-product gets sampled proportionally so all variants appear in both
+  # train and test.
+  stratify_cols:
+    - type_batch
+    - type_interactive
+    - type_map
+    - type_other
+    - nodes_req_is_one
+
+# ── SLURM feature columns to carry into chunk-index rows (24 dims) ───────────
+# Must match the columns produced by slurmETL (slurm_log.parquet). Order is
+# load-bearing — model.py uses this exact ordering for the cond vector.
+slurm_feature_cols:
+  # Temporal (4)
+  - hour_sin
+  - hour_cos
+  - dow_sin
+  - dow_cos
+  # Continuous (7)
+  - mem_unlimited
+  - mem_req_scaled
+  - nodes_req_is_one
+  - nodes_req_log
+  - cpus_req_scaled
+  - duration_scaled
+  - priority_scaled
+  # Priority tier 1-hot (3)
+  - ptier_0
+  - ptier_1
+  - ptier_2
+  # Job type 1-hot (4)
+  - type_batch
+  - type_interactive
+  - type_map
+  - type_other
+  # Job state 1-hot (6)
+  - state_other
+  - state_3
+  - state_4
+  - state_5
+  - state_6
+  - state_11
+  # Total: 24 dims (dom_sin/cos dropped per single-month leakage concern)
+
+# ── Storage ──────────────────────────────────────────────────────────────────
+storage:
+  parquet_compression: zstd
+  npy_skip_min_bytes:  64     # resume: skip existing NPYs at least this large
+
+# ── Worker / parallelism ─────────────────────────────────────────────────────
+workers:
+  reserved_cpus: 2            # CPUs left idle (cpu_count - reserved_cpus)
+  max_workers:   null         # null = auto-detect; integer overrides
+  batch_size:    500          # jobs per ProcessPoolExecutor batch

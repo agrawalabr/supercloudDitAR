@@ -1,7 +1,7 @@
 paths:
-  source: "supercloud_power/data/r/gpu"
-  intermediate: "supercloud_power/data/i/gpu"
-  gpu_traces: "supercloud_power/data/i/gpu_traces.csv"
+  source: "data/r/gpu"
+  intermediate: "data/i/gpu"
+  gpu_traces: "data/i/gpu_traces.csv"
 
 source:
   glob_pattern: "*/*.csv"

@@ -1,0 +1,103 @@
+# Top-level v5 pipeline config — read by main.py
+#
+# Each stage (seqETL, train, inference) finds its config here.
+# main.py runs them in order; pass --skip_* flags to selectively skip stages.
+
+paths:
+  # Stage configs
+  seq_etl_config: "configs/seqETL.yaml"
+
+  # Outputs from SeqETL (read by train + inference)
+  train_chunks:   "data/p/train_chunks.parquet"
+  train_jobs:     "data/p/train_jobs.parquet"
+  test_chunks:    "data/p/test_chunks.parquet"
+  test_jobs:      "data/p/test_jobs.parquet"
+  norm_stats:     "data/p/norm_stats.npz"
+
+  # Train + inference outputs
+  ckpt_dir:       "data/ckpt/v5"
+  inference_dir:  "data/inf/v5"
+
+# ── Sequence dimensions (must match seqETL.yaml exactly) ────────────────────
+sequence:
+  W_ctx:  2048
+  W_pred: 1024
+  stride: 1024
+  patch_size: 16
+
+# ── Model architecture ──────────────────────────────────────────────────────
+model:
+  d_model: 384
+  n_heads: 6
+  n_layers: 12
+  mlp_ratio: 4
+  dropout: 0.0
+  patch_size: 16
+  W_ctx: 2048
+  W_pred: 1024
+  cond_dim: 24
+  n_channels: 4
+  n_aux_channels: 3
+  diffusion_T: 1000
+
+# ── Training hyperparameters ────────────────────────────────────────────────
+train:
+  batch_size: 64                  # per-GPU; effective batch = batch_size × n_gpus
+  n_epochs: 50
+  lr: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 2000
+  grad_clip: 1.0
+  cfg_dropout_p: 0.05             # CFG conditioning dropout
+  loss_skip_threshold: 5.0        # skip batch if max per-sample loss > this
+  log_every: 50
+  ckpt_every_steps: 2000
+  ema_decay: 0.999
+  num_workers: null               # null = auto-detect
+
+  # Scheduled-noise exposure-bias mitigation (final 20% of epochs)
+  scheduled_sampling_p_max: 0.3
+  scheduled_sampling_t_min: 50
+  scheduled_sampling_t_max: 200
+
+# ── Inference ───────────────────────────────────────────────────────────────
+inference:
+  subsample_n: 1000               # null = use full test set
+  subsample_stratify_cols:
+    - type_batch
+    - type_interactive
+    - type_map
+    - type_other
+  max_windows_per_job: 25         # 25 × 1024 bins × 0.103 s ≈ 44 min per job
+                                  # (raise to ~210 for ~6hr cap if time permits)
+  ddim_steps: 50
+  cfg_scale: 1.5
+  save_per_job_traces: false      # set true to save (timestamp, real, gen) CSVs
+  seed: 42
+
+# ── SLURM cond columns (must match seqETL.yaml exactly; 24 dims) ────────────
+slurm_feature_cols:
+  - hour_sin
+  - hour_cos
+  - dow_sin
+  - dow_cos
+  - mem_unlimited
+  - mem_req_scaled
+  - nodes_req_is_one
+  - nodes_req_log
+  - cpus_req_scaled
+  - duration_scaled
+  - priority_scaled
+  - ptier_0
+  - ptier_1
+  - ptier_2
+  - type_batch
+  - type_interactive
+  - type_map
+  - type_other
+  - state_other
+  - state_3
+  - state_4
+  - state_5
+  - state_6
+  - state_11

@@ -4,7 +4,7 @@
 # then cleanup, optional Jupyter tunnel from this host ("kill port" applies only to Jupyter).
 
 # Shared HPC layout (NFS): notebooks / workload under scratch; home is typically /home/$USER.
-HPC_SCRATCH="${HPC_SCRATCH:-/scratch/aa9360}"
+HPC_SCRATCH="${HPC_SCRATCH:-/scratch/aa9360/supercloud_power}"
 
 # Jupyter prefers this port; if it is busy on the login node, the next free port is used instead.
 JUPYTER_PREFERRED_PORT="${JUPYTER_PORT:-8891}"
@@ -129,7 +129,8 @@ if [[ "$use_jupyter" -eq 1 ]]; then
     fi
 
     quoted_dir=$(printf '%q' "$NOTEBOOK_DIR")
-    jpy_cmd="set -e; d=${quoted_dir}; if [[ ! -d \"\$d\" ]]; then mkdir -p \"\$d\" || { echo \"Cannot use notebook dir: \$d\" >&2; exit 1; }; fi; cd \"\$d\" && fuser -k ${JUPYTER_LISTEN_PORT}/tcp 2>/dev/null || true; exec jupyter notebook --no-browser --port=${JUPYTER_LISTEN_PORT}"
+    # jpy_cmd="set -e; d=${quoted_dir}; if [[ ! -d \"\$d\" ]]; then mkdir -p \"\$d\" || { echo \"Cannot use notebook dir: \$d\" >&2; exit 1; }; fi; cd \"\$d\" && fuser -k ${JUPYTER_LISTEN_PORT}/tcp 2>/dev/null || true; exec jupyter notebook --no-browser --port=${JUPYTER_LISTEN_PORT}"
+    jpy_cmd="set -e; d=${quoted_dir}; if [[ ! -d \"\$d\" ]]; then mkdir -p \"\$d\" || { echo \"Cannot use notebook dir: \$d\" >&2; exit 1; }; fi; cd \"\$d\" && fuser -k ${JUPYTER_LISTEN_PORT}/tcp 2>/dev/null || true; exec jupyter lab --no-browser --port=${JUPYTER_LISTEN_PORT}"
 
     if [[ "$do_kill" -ne 1 ]]; then
         fuser -k "${JUPYTER_LISTEN_PORT}/tcp" 2>/dev/null || true

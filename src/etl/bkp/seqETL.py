@@ -179,49 +179,38 @@ class SeqETL:
             nw = min(nw, int(cap))
         return nw
 
-    # ── Phase 1: Load & merge ────────────────────────────────────────────────
+    # ── Phase 1: Load merged table ────────────────────────────────────────────
     def _load_and_merge(self) -> pd.DataFrame:
-        slurm_path = self._rp(self.paths["slurm_features"])
-        traces_path = self._rp(self.paths["gpu_traces"])
-        if not slurm_path.is_file():
-            raise FileNotFoundError(f"Missing SLURM features: {slurm_path}")
-        if not traces_path.is_file():
-            raise FileNotFoundError(f"Missing GPU traces: {traces_path}")
-
-        slurm = pd.read_parquet(slurm_path)
-        slurm["job_id"] = slurm["job_id"].astype(str)
-        traces = pd.read_csv(traces_path, dtype={"job_id": str})
+        merged_path = self._rp(self.paths["merged"])
+        if not merged_path.is_file():
+            raise FileNotFoundError(f"Missing merged table: {merged_path}")
+        merged = pd.read_parquet(merged_path)
+        merged["job_id"] = merged["job_id"].astype(str)
 
         # Confirm all required columns exist
-        missing = [c for c in self.slurm_cols if c not in slurm.columns]
+        missing = [c for c in self.slurm_cols if c not in merged.columns]
         if missing:
-            raise KeyError(f"slurm_log.parquet missing columns: {missing}")
+            raise KeyError(f"merged table missing SLURM columns: {missing}")
         for col in ["job_id", "file_path", "length", "duration_sec"]:
-            if col not in traces.columns:
-                raise KeyError(f"gpu_traces.csv missing column: {col}")
+            if col not in merged.columns:
+                raise KeyError(f"merged table missing column: {col}")
 
-        # Inner join — only keep jobs present in both
-        keep_cols = ["job_id", "file_path", "length", "duration_sec"]
-        merged = traces[keep_cols].merge(
-            slurm[["job_id"] + self.slurm_cols], on="job_id", how="inner"
-        )
         merged["length"] = merged["length"].astype(np.int64)
         merged["duration_sec"] = merged["duration_sec"].astype(np.float64)
 
-        # Sanity: drop jobs with NaN/Inf in any required column
+        # Sanity: drop jobs with NaN/Inf or non-positive length
         check_cols = self.slurm_cols + ["length", "duration_sec"]
         ok = np.isfinite(merged[check_cols].to_numpy()).all(axis=1)
         n_dropped = (~ok).sum()
         if n_dropped:
             print(f"  Dropped {n_dropped} jobs with non-finite values")
         merged = merged.loc[ok].reset_index(drop=True)
-        # Drop jobs with length <= 0
         ok2 = merged["length"] > 0
         if (~ok2).sum():
             print(f"  Dropped {(~ok2).sum()} jobs with length <= 0")
         merged = merged.loc[ok2].reset_index(drop=True)
 
-        print(f"  Loaded & merged {len(merged):,} jobs")
+        print(f"  Loaded {len(merged):,} jobs from {merged_path}")
         return merged
 
     # ── Phase 2: Stratified 9:1 split ────────────────────────────────────────

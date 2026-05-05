@@ -1,9 +1,9 @@
 paths:
-  gpu_traces: supercloud_power/data/i/gpu_traces.csv
-  intermediate: supercloud_power/data/i/slurm_log.parquet
-  source: supercloud_power/data/r/slurm-log.csv
-  plot: supercloud_power/data/i/plot/slurm_plots.png
-  corr: supercloud_power/data/i/plot/slurm_corr_heatmap.png
+  gpu_traces: data/i/gpu_traces.csv
+  intermediate: data/i/slurm_log.parquet
+  source: data/r/slurm-log.csv
+  plot: data/i/plot/slurm_plots.png
+  corr: data/i/plot/slurm_corr_heatmap.png
 
 source:
   slurm_usecols:
