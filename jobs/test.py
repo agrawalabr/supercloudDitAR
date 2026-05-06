@@ -14,7 +14,7 @@ top100_files = sorted(all_files, key=lambda f: os.path.getsize(f), reverse=True)
 
 def get_file_stats(f):
     try:
-        df = pd.read_csv(f, columns=["timestamp"])
+        df = pd.read_csv(f, usecols=["timestamp"])
         ts = df["timestamp"].sort_values().to_numpy()
         n = len(ts)
         if n == 0:

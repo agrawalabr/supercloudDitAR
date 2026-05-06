@@ -28,8 +28,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import model as M
-import seqETL
+import ditArV5 as M
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,9 +158,7 @@ def generate_job(
 # ─────────────────────────────────────────────────────────────────────────────
 # Stratified subsample
 # ─────────────────────────────────────────────────────────────────────────────
-def stratified_subsample(
-    df: pd.DataFrame, n: int, stratify_cols: list, seed: int = 42
-) -> pd.DataFrame:
+def stratified_subsample(df: pd.DataFrame, n: int, stratify_cols: list, seed: int = 42) -> pd.DataFrame:
     """Pick n jobs across the cross-product of stratify_cols, proportional."""
     if n >= len(df) or not stratify_cols:
         return df.sample(n=min(n, len(df)), random_state=seed)

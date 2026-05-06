@@ -8,6 +8,9 @@ Notes on the implementation:
   - Inherits torch.utils.data.Dataset for proper DataLoader integration.
   - chunk-index columns are pre-extracted to numpy arrays at __init__ for
     fast __getitem__ (pandas .iloc is slow at this scale, ~36M rows).
+  - Job IDs are resolved to integer indices at __init__ time so that
+    __getitem__ uses O(1) array indexing instead of string dict hashing.
+    At 26M chunks/epoch this eliminates ~78M Python dict hash computations.
   - mmap is opened lazily per file with a bounded LRU so we never exceed
     the OS file-descriptor limit (typical default 1024).
 """
@@ -21,10 +24,11 @@ import torch
 from torch.utils.data import Dataset
 
 
-# Bounded LRU keeps memory + fd footprint small. mmap reopen is cheap (~µs),
-# so we don't lose much on cache miss. Set MMAP_LRU_MAX = 256 — comfortably
-# under the typical 1024 fd limit.
-MMAP_LRU_MAX = 256
+# Per-worker mmap cache size. Each open mmap consumes one OS file descriptor.
+# With N workers per rank the total fds from mmaps alone is N × MMAP_LRU_MAX,
+# so keep this well under (os_fd_limit / workers_per_rank).
+# 512 is enough to cover the hot job set with random-shuffle access patterns.
+MMAP_LRU_MAX = 512
 
 
 class PowerTraceDataset(Dataset):
@@ -59,28 +63,31 @@ class PowerTraceDataset(Dataset):
         self.n_ch       = int(n_channels)
         self.slurm_cols = list(slurm_cols)
 
-        # Load chunk index. Pre-extract to numpy for fast __getitem__:
-        # pandas .iloc[i] does index validation per call which is slow at
-        # ~36M rows × multiple epochs.
-        chunks = pd.read_parquet(chunks_parquet)
-        self._chunk_job_id    = chunks["job_id"].astype(str).to_numpy()
-        self._chunk_chunk_idx = chunks["chunk_idx"].astype(np.int64).to_numpy()
-
-        # Job-level metadata: per-job dicts indexed by job_id (str).
+        # ── Job-level arrays (indexed by integer job index, not string key) ──
+        # Replacing string-keyed dicts with numpy array lookups eliminates
+        # ~3 dict hash computations per __getitem__ call (×26M/epoch = ~78M saved).
         jobs = pd.read_parquet(jobs_parquet)
-        jobs_jid = jobs["job_id"].astype(str).to_numpy()
-        self._npy_path = dict(zip(jobs_jid, jobs["npy_path"].astype(str).to_numpy()))
-        self._length   = dict(zip(jobs_jid, jobs["length"].astype(np.int64).to_numpy()))
-        # SLURM as one stacked array; each row referenced via job_id index.
-        slurm_arr = jobs[self.slurm_cols].to_numpy(np.float32)
-        self._slurm = dict(zip(jobs_jid, slurm_arr))
+        jobs_jid_str = jobs["job_id"].astype(str).to_numpy()
+        job_id_to_idx: dict[str, int] = {jid: i for i, jid in enumerate(jobs_jid_str)}
+
+        self._job_ids   = jobs_jid_str                                   # (N_jobs,) str
+        self._npy_paths = jobs["npy_path"].astype(str).to_numpy()       # (N_jobs,) str
+        self._lengths   = jobs["length"].astype(np.int64).to_numpy()    # (N_jobs,)
+        self._slurm_arr = jobs[self.slurm_cols].to_numpy(np.float32)    # (N_jobs, 24)
+
+        # ── Chunk index: pre-resolve job_id strings → integer job indices ──
+        # Stored as int32 to halve memory vs int64; N_jobs << 2^31.
+        chunks = pd.read_parquet(chunks_parquet)
+        chunk_jids = chunks["job_id"].astype(str).to_numpy()
+        self._chunk_jidx      = np.array([job_id_to_idx[j] for j in chunk_jids], dtype=np.int32)
+        self._chunk_chunk_idx = chunks["chunk_idx"].astype(np.int64).to_numpy()
 
         # Bounded LRU mmap cache. Per-process state — DataLoader workers each
         # maintain their own copy after fork.
         self._mmap_lru: "OrderedDict[str, np.ndarray]" = OrderedDict()
 
     def __len__(self) -> int:
-        return len(self._chunk_job_id)
+        return len(self._chunk_jidx)
 
     def _get_mmap(self, npy_path: str) -> np.ndarray:
         m = self._mmap_lru.get(npy_path)
@@ -96,11 +103,11 @@ class PowerTraceDataset(Dataset):
         return m
 
     def __getitem__(self, idx: int) -> dict:
-        job_id = str(self._chunk_job_id[idx])
-        ci     = int(self._chunk_chunk_idx[idx])
+        jidx = int(self._chunk_jidx[idx])          # O(1) array lookup, no string hash
+        ci   = int(self._chunk_chunk_idx[idx])
 
-        arr = self._get_mmap(self._npy_path[job_id])   # shape (n_ch, L) float32
-        L   = int(self._length[job_id])
+        arr = self._get_mmap(self._npy_paths[jidx])  # shape (n_ch, L) float32
+        L   = int(self._lengths[jidx])
         chunk_start = ci * self.stride
 
         # Past context: bins [chunk_start - W_ctx, chunk_start) — left-zero-padded
@@ -121,12 +128,12 @@ class PowerTraceDataset(Dataset):
         pred_mask[:n_real] = 1.0
 
         return {
-            "ctx":        ctx,                  # (n_ch, W_ctx) float32
-            "future_aux": future[:3],           # (3, W_pred)  float32
-            "target":     future[3:4],          # (1, W_pred)  float32
-            "pred_mask":  pred_mask,            # (W_pred,)    float32
-            "cond":       self._slurm[job_id],  # (24,)        float32
-            "job_id":     job_id,
+            "ctx":        ctx,                       # (n_ch, W_ctx) float32
+            "future_aux": future[:3],                # (3, W_pred)  float32
+            "target":     future[3:4],               # (1, W_pred)  float32
+            "pred_mask":  pred_mask,                 # (W_pred,)    float32
+            "cond":       self._slurm_arr[jidx],     # (24,)        float32
+            "job_id":     self._job_ids[jidx],       # str
             "chunk_idx":  ci,
         }
 

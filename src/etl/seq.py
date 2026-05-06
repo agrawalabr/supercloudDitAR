@@ -19,9 +19,7 @@ Outputs:
   train_chunks.parquet            (job_id, chunk_idx)
   test_chunks.parquet             (job_id, chunk_idx)
   norm_stats.npz                  per-channel mean/std
-
-The PowerTraceDataset class at the bottom of this file is imported directly
-by training/inference code.
+  
 """
 from __future__ import annotations
 import numpy as np
@@ -33,7 +31,7 @@ import os, sys, time, yaml, math
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import NamedTuple
 
-CONFIG = Path(__file__).resolve().parent.parent / "configs" / "seqETL.yaml"
+CONFIG = Path(__file__).resolve().parent.parent.parent / "configs" / "seqETL.yaml"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Module-level helpers (must be picklable for ProcessPoolExecutor)
@@ -114,32 +112,6 @@ def _normalize_worker(t: _NormTask):
             pass
         return t.job_id, None, f"write_err:{e.__class__.__name__}"
     return t.job_id, T, None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Resource detection helper (used across train.py / inference.py too)
-# ─────────────────────────────────────────────────────────────────────────────
-def detect_resources(reserved_cpus: int = 2) -> dict:
-    """Detect CPU and GPU resources available to this process."""
-    info = {
-        "cpu_count":      os.cpu_count() or 4,
-        "workers":        max(1, (os.cpu_count() or 4) - reserved_cpus),
-        "gpu_count":      0,
-        "gpu_name":       None,
-        "vram_gb":        0.0,
-        "bf16_supported": False,
-    }
-    try:
-        import torch
-        if torch.cuda.is_available():
-            info["gpu_count"] = torch.cuda.device_count()
-            props = torch.cuda.get_device_properties(0)
-            info["gpu_name"]       = props.name
-            info["vram_gb"]        = props.total_memory / 1e9
-            info["bf16_supported"] = torch.cuda.is_bf16_supported()
-    except ImportError:
-        pass
-    return info
 
 
 # ─────────────────────────────────────────────────────────────────────────────

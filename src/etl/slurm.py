@@ -12,7 +12,7 @@ import sys, yaml, time, math
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import QuantileTransformer
 
-CONFIG = Path(__file__).resolve().parent.parent / "configs" / "slurmETL.yaml"
+CONFIG = Path(__file__).resolve().parent.parent.parent / "configs" / "slurmETL.yaml"
 
 def _dummy_prefix(prefix: str) -> str:
     """pd.get_dummies adds '<prefix>_<value>'; YAML may store 'name' or 'name_'."""
@@ -134,7 +134,7 @@ class SlurmETL:
         print(f"Wrote {len(slurm_df)} rows → {out} ({time.perf_counter() - t0:.2f}s)", flush=True)
         return 0
 
-    def plot_features(self, source: str | Path = None) -> None:
+    def plot_features(self, source: str | Path = None) -> int:
         source = Path(self._rp(source)) if source else Path(self._rp(self.paths["intermediate"]))
         target = Path(self._rp(self.paths["plot"]))
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -162,7 +162,7 @@ class SlurmETL:
         print(f"Saved plot to {target}", flush=True)
         return 0
 
-    def correlation_heatmap(self, source: str | Path = None) -> None:
+    def correlation_heatmap(self, source: str | Path = None) -> int:
         source = Path(self._rp(source)) if source else Path(self._rp(self.paths["intermediate"]))
         target = Path(self._rp(self.paths["corr"]))
         target.parent.mkdir(parents=True, exist_ok=True)

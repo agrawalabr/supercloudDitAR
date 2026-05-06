@@ -15,8 +15,8 @@ paths:
   norm_stats:     "data/p/norm_stats.npz"
 
   # Train + inference outputs
-  ckpt_dir:       "data/ckpt/v5"
-  inference_dir:  "data/inf/v5"
+  ckpt_dir:       "output/v5/ckpt"
+  inference_dir:  "data/v5/inference"
 
 # ── Sequence dimensions (must match seqETL.yaml exactly) ────────────────────
 sequence:
@@ -42,7 +42,7 @@ model:
 
 # ── Training hyperparameters ────────────────────────────────────────────────
 train:
-  batch_size: 64                  # per-GPU; effective batch = batch_size × n_gpus
+  batch_size: 512                 # per-GPU; effective batch = 1024 across 2 H200s
   n_epochs: 50
   lr: 1.0e-4
   weight_decay: 0.01
@@ -51,9 +51,11 @@ train:
   cfg_dropout_p: 0.05             # CFG conditioning dropout
   loss_skip_threshold: 5.0        # skip batch if max per-sample loss > this
   log_every: 50
-  ckpt_every_steps: 2000
+  ckpt_every_steps: 500           # save every 500 steps; limits data loss on unexpected kill
   ema_decay: 0.999
-  num_workers: null               # null = auto-detect
+  num_workers: 12                 # 12 per rank × 2 GPUs = 24 total; keeps fd usage under limit
+  prefetch_factor: 2              # 2 batches ahead per worker; halves pin_memory fd pressure
+  compile: true                   # torch.compile for ~20-40% kernel speedup on H200
 
   # Scheduled-noise exposure-bias mitigation (final 20% of epochs)
   scheduled_sampling_p_max: 0.3

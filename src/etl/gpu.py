@@ -20,10 +20,10 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
-CONFIG = Path(__file__).resolve().parent.parent / "configs" / "gpuETL.yaml"
+CONFIG = Path(__file__).resolve().parent.parent.parent / "configs" / "gpuETL.yaml"
 BATCH_SIZE = 500
 
-# ── Module-level helpers (must be picklable for ProcessPoolExecutor) ──────────x
+# ── Module-level helpers (must be picklable for ProcessPoolExecutor) ─────────
 def _parquet_ok(args):
     """Return True if the parquet at path exists, is large enough, and is readable."""
     path, min_bytes = args
