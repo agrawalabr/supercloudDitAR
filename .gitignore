@@ -10,3 +10,8 @@ data/
 test.txt
 outputs/
 slurm_*
+.virtual*/
+.ipynb*/
+.torch*/
+output/
+slurm*/

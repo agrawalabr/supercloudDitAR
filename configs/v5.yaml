@@ -16,16 +16,18 @@ paths:
 
   # Train + inference outputs
   ckpt_dir:       "output/v5/ckpt"
-  inference_dir:  "data/v5/inference"
+  inference_dir:  "data/inference/v5"
 
 # ── Sequence dimensions (must match seqETL.yaml exactly) ────────────────────
 sequence:
-  W_ctx:  2048
-  W_pred: 1024
-  stride: 1024
+  W_ctx:  16384  # 16384 bins × 0.103 s ≈ 28 min of context
+  W_pred: 8192   # 8192  bins × 0.103 s ≈ 14 min prediction window
+  stride: 8192   # stride = W_pred → non-overlapping windows, no train/inference mismatch
   patch_size: 16
 
 # ── Model architecture ──────────────────────────────────────────────────────
+# N_tokens = 1 (cond) + W_ctx/P (1024) + W_pred/P (512) + W_pred/P (512) = 2049
+# 1 H200 (141 GB), B=256, N=2049: activations ≈ 58 GB → ~66 GB total (47% of VRAM).
 model:
   d_model: 384
   n_heads: 6
@@ -33,29 +35,51 @@ model:
   mlp_ratio: 4
   dropout: 0.0
   patch_size: 16
-  W_ctx: 2048
-  W_pred: 1024
+  W_ctx: 16384
+  W_pred: 8192
   cond_dim: 24
   n_channels: 4
   n_aux_channels: 3
   diffusion_T: 1000
+  # Gradient checkpointing: recomputes each DiT block during backward instead of
+  # caching its activations. Reduces activation VRAM from O(n_layers) to O(1) —
+  # mandatory on <80 GB GPUs (L40S 44 GB), optional on H200 (141 GB).
+  # Cost: ~2× backward compute. Set false only on H200 for max throughput.
+  use_checkpoint: true
 
 # ── Training hyperparameters ────────────────────────────────────────────────
 train:
-  batch_size: 512                 # per-GPU; effective batch = 1024 across 2 H200s
-  n_epochs: 50
-  lr: 1.0e-4
+  batch_size: 1024                # per-GPU (effective 2048 across 2× H200 with DDP).
+                                  # use_checkpoint=true stores only 12 block-input boundaries
+                                  # (~20 GB) + peak for one block recompute (~20 GB) = ~42 GB
+                                  # total (30% of 139 GB). Safe and GPU-heavy.
+  n_epochs: 20
+  lr: 1.5e-5                      # halved from 3e-5 — previous run diverged at step ~8000
+                                  # with grad_clip=0.5; lower LR reduces per-step gradient
+                                  # magnitude so clip is less likely to be insufficient.
   weight_decay: 0.01
-  warmup_steps: 2000
-  grad_clip: 1.0
-  cfg_dropout_p: 0.05             # CFG conditioning dropout
-  loss_skip_threshold: 5.0        # skip batch if max per-sample loss > this
+  warmup_steps: 1000              # 1000 steps at effective B=2048: ~2M samples warmup
+  grad_clip: 0.3                  # tightened from 0.5 — previous divergence (step ~8000)
+                                  # suggests 0.5 was insufficient with use_checkpoint=true.
+  cfg_dropout_p: 0.05
+  loss_skip_threshold: 2.0        # tightened from 3.0 — catch outlier samples earlier,
+                                  # preventing bad gradients from accumulating before zeroing.
+  max_steps_per_epoch: null       # see all ~3 285 steps/epoch (3 370 841 ÷ 2 GPUs ÷ 1024).
+                                  # 100% of data every epoch.
   log_every: 50
-  ckpt_every_steps: 500           # save every 500 steps; limits data loss on unexpected kill
-  ema_decay: 0.999
-  num_workers: 12                 # 12 per rank × 2 GPUs = 24 total; keeps fd usage under limit
-  prefetch_factor: 2              # 2 batches ahead per worker; halves pin_memory fd pressure
-  compile: true                   # torch.compile for ~20-40% kernel speedup on H200
+  ckpt_every_steps: 500
+  ema_decay: 0.9999
+  num_workers: 4                  # 4 workers per rank (was 16). Fewer workers = 4× faster
+                                  # DataLoader startup (forkserver only needs to fork 4 procs
+                                  # instead of 16; each takes ~30 s to init parquet index).
+                                  # Still sufficient: at B=1024 each step takes ~300 ms so
+                                  # workers have plenty of time to prefetch ahead.
+  prefetch_factor: 8              # 4 workers × 8 prefetch = 32 batches buffered; hides any
+                                  # remaining I/O latency and keeps GPU fed continuously.
+  compile: false                  # Disabled: torch.compile causes 5-20 min of 0% GPU
+                                  # utilisation on first run (kernel tracing), which triggers
+                                  # idle-GPU node termination on Supercloud. H200 is fast
+                                  # enough without it. Re-enable once compile cache is warm.
 
   # Scheduled-noise exposure-bias mitigation (final 20% of epochs)
   scheduled_sampling_p_max: 0.3
@@ -64,14 +88,11 @@ train:
 
 # ── Inference ───────────────────────────────────────────────────────────────
 inference:
-  subsample_n: 1000               # null = use full test set
-  subsample_stratify_cols:
-    - type_batch
-    - type_interactive
-    - type_map
-    - type_other
-  max_windows_per_job: 25         # 25 × 1024 bins × 0.103 s ≈ 44 min per job
-                                  # (raise to ~210 for ~6hr cap if time permits)
+  subsample_n: 30               # null = use full test set
+  subsample_stratify_cols: []
+  max_windows_per_job: 103        # 103 × 8192 bins × 0.103 s ≈ 24.2 h per job
+                                  # covers 100% of <1hr jobs (≤5 windows) and 100%
+                                  # of 1–24hr jobs; first 24hr generated for >24hr jobs
   ddim_steps: 50
   cfg_scale: 1.5
   save_per_job_traces: false      # set true to save (timestamp, real, gen) CSVs

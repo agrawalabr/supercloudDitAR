@@ -21,6 +21,9 @@ import argparse, math, os, sys, time
 from pathlib import Path
 from typing import Optional
 
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend for HPC/batch jobs
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -35,9 +38,8 @@ import ditArV5 as M
 # DDIM sampler with CFG
 # ─────────────────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def ddim_sample(
-    net: torch.nn.Module,
-    sched: M.DiffusionSchedule,
+def ddim_sample(net: torch.nn.Module,
+sched: M.DiffusionSchedule,
     ctx: torch.Tensor,             # (B, n_ch, W_ctx)
     future_aux: torch.Tensor,      # (B, 3, W_pred)
     cond: torch.Tensor,            # (B, cond_dim)
@@ -101,16 +103,7 @@ def ddim_sample(
 # Per-job AR generation
 # ─────────────────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def generate_job(
-    net: torch.nn.Module,
-    sched: M.DiffusionSchedule,
-    npy_arr: np.ndarray,           # (4, T) float32, normalized
-    cond: np.ndarray,              # (24,) float32
-    W_ctx: int, W_pred: int, stride: int,
-    max_windows: int,
-    n_steps: int, cfg_scale: float,
-    device: torch.device,
-) -> np.ndarray:
+def generate_job(net: torch.nn.Module, sched: M.DiffusionSchedule, npy_arr: np.ndarray, cond: np.ndarray, W_ctx: int, W_pred: int, stride: int, max_windows: int, n_steps: int, cfg_scale: float, device: torch.device) -> np.ndarray:
     """Returns generated power channel of shape (T_capped,) in z-score space."""
     L = npy_arr.shape[1]
     T_capped = min(L, max_windows * W_pred)
@@ -201,23 +194,105 @@ def metrics(real: np.ndarray, fake: np.ndarray) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Plotting
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_samples_from_disk(synth_dir: Path, test_jobs: pd.DataFrame, log_mean_pwr: float, log_std_pwr: float, n_samples: int = 6, save_path: Optional[Path] = None) -> None:
+    """Plot real vs generated power traces using saved .npy files from synth_dir.
+
+    Picks n_samples jobs spread across the duration range so the figure covers
+    short, medium, and long jobs rather than clustering at one end.
+    """
+    synth_dir = Path(synth_dir)
+    if save_path is None:
+        save_path = synth_dir.parent / "samples.png"
+
+    # Keep only rows for which a generation exists on disk
+    job_ids = test_jobs["job_id"].astype(str)
+    mask = job_ids.apply(lambda jid: (synth_dir / f"{jid}.npy").exists())
+    available = test_jobs[mask].copy()
+    if available.empty:
+        print(f"No generations found in {synth_dir} — nothing to plot.")
+        return
+
+    # Sort by trace duration so picks span the full range
+    if "duration_sec" in available.columns:
+        available = available.sort_values("duration_sec").reset_index(drop=True)
+    pick_rows = available.iloc[
+        np.linspace(0, len(available) - 1, min(n_samples, len(available)), dtype=int)
+    ]
+
+    fig, axes = plt.subplots(len(pick_rows), 1, figsize=(15, 2.5 * len(pick_rows)))
+    if len(pick_rows) == 1:
+        axes = [axes]
+
+    for ax, (_, row) in zip(axes, pick_rows.iterrows()):
+        jid = str(row["job_id"])
+        nodes_req = int(row["nodes_req"]) if "nodes_req" in row.index else 1
+
+        try:
+            arr   = np.load(row["npy_path"], mmap_mode="r")   # (4, L)
+            gen_z = np.load(synth_dir / f"{jid}.npy").astype(np.float32)
+        except Exception as exc:
+            print(f"  Skip {jid}: {exc}")
+            ax.set_visible(False)
+            continue
+
+        real_z = np.asarray(arr[3, : len(gen_z)], dtype=np.float32)
+        real_W = denormalize_power(real_z, log_mean_pwr, log_std_pwr)
+        gen_W  = denormalize_power(gen_z,  log_mean_pwr, log_std_pwr)
+
+        if real_z.std() > 1e-8 and gen_z.std() > 1e-8:
+            pr = float(np.corrcoef(real_z, gen_z)[0, 1])
+        else:
+            pr = 0.0
+
+        dur_min = len(gen_z) * 0.103 / 60.0
+        ax.plot(real_W, label="Real",      lw=0.6, alpha=0.85)
+        ax.plot(gen_W,  label="Generated", lw=0.6, alpha=0.85)
+        ax.set_title(
+            f"job={jid}  nodes={nodes_req}  dur={dur_min:.1f} min  "
+            f"pearson_r={pr:+.3f}  "
+            f"real(μ/max)={real_W.mean():.0f}/{real_W.max():.0f} W  "
+            f"gen(μ/max)={gen_W.mean():.0f}/{gen_W.max():.0f} W",
+            fontsize=9,
+        )
+        ax.set_ylabel("Power (W)")
+        ax.legend(loc="upper right")
+        ax.grid(alpha=0.3)
+
+    axes[-1].set_xlabel("step (0..L-1)")
+    fig.suptitle(
+        "Real vs Generated GPU Power Traces — DiT v5 Test Set",
+        fontsize=11, y=1.0,
+    )
+    plt.tight_layout()
+    plt.savefig(str(save_path), dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved plot → {save_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main inference run
 # ─────────────────────────────────────────────────────────────────────────────
-def run(cfg: dict) -> int:
+def run(cfg: dict, ckpt_dir: str = None) -> int:
     inf_cfg = cfg["inference"]
     paths   = cfg["paths"]
     seq_cfg = cfg["sequence"]
     out_dir = Path(paths["inference_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
+    synth_dir = out_dir / "synth"
+    synth_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Device + checkpoint ──
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
+    ckpt_dir = ckpt_dir if ckpt_dir else paths["ckpt_dir"]
+
     # Load EMA checkpoint
-    ckpt_path = Path(paths["ckpt_dir"]) / "ema.pt"
+    ckpt_path = Path(ckpt_dir) / "ema.pt"
     if not ckpt_path.is_file():
-        ckpt_path = Path(paths["ckpt_dir"]) / "last.pt"
+        ckpt_path = Path(ckpt_dir) / "last.pt"
         print(f"Warning: ema.pt not found, using {ckpt_path}")
     sd = torch.load(ckpt_path, map_location=device)
 
@@ -287,6 +362,8 @@ def run(cfg: dict) -> int:
         real_W = denormalize_power(real_z, log_mean_pwr, log_std_pwr)
         gen_W  = denormalize_power(gen_z,  log_mean_pwr, log_std_pwr)
 
+        np.save(synth_dir / f"{job_id}.npy", gen_z)
+
         m = metrics(real_W, gen_W)
         m["job_id"] = job_id
         m["length"] = len(gen_z)
@@ -318,6 +395,12 @@ def run(cfg: dict) -> int:
         print(f"  MAE  (watts) — mean: {summary_df['mae'].mean():.1f}, "
               f"median: {summary_df['mae'].median():.1f}")
     print(f"Wrote {summary_path}")
+
+    # ── Plot real vs generated samples ──
+    n_plot = int(inf_cfg.get("plot_n_samples", 6))
+    
+    plot_samples_from_disk(synth_dir=synth_dir,test_jobs=test_jobs, log_mean_pwr=log_mean_pwr, log_std_pwr=log_std_pwr, n_samples=n_plot, save_path=out_dir / "samples.png")
+
     return 0
 
 
@@ -325,7 +408,8 @@ if __name__ == "__main__":
     import yaml
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
+    ap.add_argument("--ckpt_dir", required=True)
     args = ap.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    sys.exit(run(cfg))
+    sys.exit(run(cfg, args.ckpt_dir))

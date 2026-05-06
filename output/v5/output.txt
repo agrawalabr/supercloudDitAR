@@ -1,19 +1,123 @@
+Loaded config: /scratch/aa9360/supercloud_power/configs/seqETL.yaml
+  train: 84,026 jobs → 3,370,841 chunks
+  Wrote /scratch/aa9360/supercloud_power/data/p/train_chunks.parquet (3,370,841 chunks)
+  test: 9,336 jobs → 369,256 chunks
+  Wrote /scratch/aa9360/supercloud_power/data/p/test_chunks.parquet (369,256 chunks)
+rebuild_chunks_only done in 1.8s
 Stage 1: Train
 Raised fd limit: 1024 → 65536
-DDP rendezvous port: 41485
+DDP rendezvous port: 58777
 Detected resources: {'cpu_count': 128, 'workers': 126, 'gpu_count': 2, 'gpu_name': 'NVIDIA H200', 'vram_gb': 150.110011392, 'bf16_supported': True}
-[rank 1] GPU 1 (NVIDIA H200): 137.6 GB free / 139.8 GB total
-[rank 0] GPU 0 (NVIDIA H200): 137.4 GB free / 139.8 GB total
-[00:34:56][rank 1] device=cuda:1, amp_dtype=torch.bfloat16, world_size=2
-[00:34:56][rank 0] device=cuda:0, amp_dtype=torch.bfloat16, world_size=2
-[00:35:00][rank 0] dataset: 26,660,682 chunks
-[00:35:00][rank 0] dataloader: batch_size=512 num_workers=12 prefetch_factor=2
-[00:35:01][rank 1] torch.compile wrapping model (kernel tracing happens on the FIRST batch — expect 5-20 min of silence per rank)
-[00:35:01][rank 0] model: 33.0M params
-[00:35:01][rank 0] torch.compile wrapping model (kernel tracing happens on the FIRST batch — expect 5-20 min of silence per rank)
-[00:35:11][rank 1] torch.compile graph captured
-[00:35:12][rank 0] torch.compile graph captured
-[00:35:12][rank 1] ── epoch 0 started | steps_this_epoch=26,035 | GPU 1: 3.4/139.8 GB used
-[00:35:12][rank 0] ── epoch 0 started | steps_this_epoch=26,035 | GPU 0: 3.7/139.8 GB used
-[00:36:12][rank 1] ♥ alive | step 0 | GPU 1: 3.4/139.8 GB used
-[00:36:12][rank 0] ♥ alive | step 0 | GPU 0: 3.7/139.8 GB used
+[18:06:03][rank 0] GPU 0 (NVIDIA H200): 139.3 GB free / 139.8 GB total
+[18:06:03][rank 1] GPU 1 (NVIDIA H200): 139.3 GB free / 139.8 GB total
+[18:06:03][rank 1] device=cuda:1, amp_dtype=torch.bfloat16, world_size=2
+[18:06:03][rank 0] device=cuda:0, amp_dtype=torch.bfloat16, world_size=2
+[18:06:04][rank 0] dataset: 3,370,841 chunks
+[18:06:04][rank 0] dataloader: batch_size=1024 num_workers=4 prefetch_factor=8
+[18:06:04][rank 0] model: 33.7M params
+[18:07:19][rank 1] DataLoader workers launched (pre-start)
+[18:07:19][rank 1] GPU keepalive: running dummy forward passes for 90s while DataLoader workers initialize...
+[18:07:19][rank 0] DataLoader workers launched (pre-start)
+[18:07:19][rank 0] GPU keepalive: running dummy forward passes for 90s while DataLoader workers initialize...
+[18:08:49][rank 1] GPU keepalive done — workers should be ready
+[18:08:49][rank 1] ── epoch 0 started | steps_this_epoch=1,645 | GPU 1: 1.8/139.8 GB used
+[18:08:50][rank 0] GPU keepalive done — workers should be ready
+[18:08:50][rank 0] ── epoch 0 started | steps_this_epoch=1,645 | GPU 0: 2.0/139.8 GB used
+[18:09:04][rank 1] ✓ first batch done (torch.compile warmup complete) | GPU 1: 5.5/139.8 GB used
+[18:09:04][rank 0] ✓ first batch done (torch.compile warmup complete) | GPU 0: 5.6/139.8 GB used
+[18:09:49][rank 1] ♥ alive | step 13 | GPU 1: 90.3/139.8 GB used
+[18:09:50][rank 0] ♥ alive | step 13 | GPU 0: 90.4/139.8 GB used
+[18:10:49][rank 1] ♥ alive | step 30 | GPU 1: 90.3/139.8 GB used
+[18:10:50][rank 0] ♥ alive | step 30 | GPU 0: 90.4/139.8 GB used
+[18:11:49][rank 1] ♥ alive | step 47 | GPU 1: 90.3/139.8 GB used
+[18:11:50][rank 0] ♥ alive | step 47 | GPU 0: 90.4/139.8 GB used
+[18:11:58] step 50/32900 ep 0 lr 7.35e-07 loss 0.9197 skipped 1093 rate 0.3 steps/s eta 9.1h ss_p 0.00 GPU0: 90.4GB
+[18:12:49][rank 1] ♥ alive | step 64 | GPU 1: 90.3/139.8 GB used
+[18:12:50][rank 0] ♥ alive | step 64 | GPU 0: 90.4/139.8 GB used
+[18:13:49][rank 1] ♥ alive | step 81 | GPU 1: 90.3/139.8 GB used
+[18:13:50][rank 0] ♥ alive | step 81 | GPU 0: 90.4/139.8 GB used
+[18:14:49][rank 1] ♥ alive | step 98 | GPU 1: 90.3/139.8 GB used
+[18:14:50][rank 0] ♥ alive | step 98 | GPU 0: 90.4/139.8 GB used
+[18:14:56] step 100/32900 ep 0 lr 1.49e-06 loss 0.8995 skipped 2254 rate 0.3 steps/s eta 9.1h ss_p 0.00 GPU0: 90.4GB
+[18:15:49][rank 1] ♥ alive | step 115 | GPU 1: 90.3/139.8 GB used
+[18:15:50][rank 0] ♥ alive | step 115 | GPU 0: 90.4/139.8 GB used
+[18:16:49][rank 1] ♥ alive | step 131 | GPU 1: 90.3/139.8 GB used
+[18:16:50][rank 0] ♥ alive | step 131 | GPU 0: 90.4/139.8 GB used
+[18:17:49][rank 1] ♥ alive | step 148 | GPU 1: 90.3/139.8 GB used
+[18:17:50][rank 0] ♥ alive | step 148 | GPU 0: 90.4/139.8 GB used
+[18:17:54] step 150/32900 ep 0 lr 2.23e-06 loss 0.8965 skipped 3390 rate 0.3 steps/s eta 9.1h ss_p 0.00 GPU0: 90.4GB
+[18:18:49][rank 1] ♥ alive | step 165 | GPU 1: 90.3/139.8 GB used
+[18:18:50][rank 0] ♥ alive | step 165 | GPU 0: 90.4/139.8 GB used
+[18:19:49][rank 1] ♥ alive | step 182 | GPU 1: 90.3/139.8 GB used
+[18:19:50][rank 0] ♥ alive | step 182 | GPU 0: 90.4/139.8 GB used
+[18:20:49][rank 1] ♥ alive | step 199 | GPU 1: 90.3/139.8 GB used
+[18:20:50][rank 0] ♥ alive | step 199 | GPU 0: 90.4/139.8 GB used
+[18:20:52] step 200/32900 ep 0 lr 2.99e-06 loss 0.8822 skipped 4284 rate 0.3 steps/s eta 9.1h ss_p 0.00 GPU0: 90.4GB
+[18:21:49][rank 1] ♥ alive | step 216 | GPU 1: 90.3/139.8 GB used
+[18:21:50][rank 0] ♥ alive | step 216 | GPU 0: 90.4/139.8 GB used
+[18:22:49][rank 1] ♥ alive | step 233 | GPU 1: 90.3/139.8 GB used
+[18:22:50][rank 0] ♥ alive | step 233 | GPU 0: 90.4/139.8 GB used
+[18:23:49][rank 1] ♥ alive | step 249 | GPU 1: 90.3/139.8 GB used
+[18:23:50][rank 0] ♥ alive | step 249 | GPU 0: 90.4/139.8 GB used
+[18:23:50] step 250/32900 ep 0 lr 3.74e-06 loss 0.8473 skipped 4964 rate 0.3 steps/s eta 9.1h ss_p 0.00 GPU0: 90.4GB
+[18:24:49][rank 1] ♥ alive | step 266 | GPU 1: 90.3/139.8 GB used
+[18:24:50][rank 0] ♥ alive | step 266 | GPU 0: 90.4/139.8 GB used
+[18:25:49][rank 1] ♥ alive | step 283 | GPU 1: 90.3/139.8 GB used
+[18:25:50][rank 0] ♥ alive | step 283 | GPU 0: 90.4/139.8 GB used
+[18:26:47] step 300/32900 ep 0 lr 4.49e-06 loss 0.7964 skipped 5470 rate 0.3 steps/s eta 9.1h ss_p 0.00 GPU0: 90.4GB
+[18:26:49][rank 1] ♥ alive | step 300 | GPU 1: 90.3/139.8 GB used
+[18:26:50][rank 0] ♥ alive | step 300 | GPU 0: 90.4/139.8 GB used
+[18:27:49][rank 1] ♥ alive | step 317 | GPU 1: 90.3/139.8 GB used
+[18:27:50][rank 0] ♥ alive | step 317 | GPU 0: 90.4/139.8 GB used
+[18:28:49][rank 1] ♥ alive | step 334 | GPU 1: 90.3/139.8 GB used
+[18:28:50][rank 0] ♥ alive | step 334 | GPU 0: 90.4/139.8 GB used
+[18:29:45] step 350/32900 ep 0 lr 5.23e-06 loss 0.7207 skipped 5883 rate 0.3 steps/s eta 9.0h ss_p 0.00 GPU0: 90.4GB
+[18:29:49][rank 1] ♥ alive | step 351 | GPU 1: 90.3/139.8 GB used
+[18:29:50][rank 0] ♥ alive | step 351 | GPU 0: 90.4/139.8 GB used
+[18:30:49][rank 1] ♥ alive | step 368 | GPU 1: 90.3/139.8 GB used
+[18:30:50][rank 0] ♥ alive | step 368 | GPU 0: 90.4/139.8 GB used
+[18:31:49][rank 1] ♥ alive | step 384 | GPU 1: 90.3/139.8 GB used
+[18:31:50][rank 0] ♥ alive | step 384 | GPU 0: 90.4/139.8 GB used
+[18:32:43] step 400/32900 ep 0 lr 5.99e-06 loss 0.7057 skipped 6233 rate 0.3 steps/s eta 9.0h ss_p 0.00 GPU0: 90.4GB
+[18:32:49][rank 1] ♥ alive | step 401 | GPU 1: 90.3/139.8 GB used
+[18:32:50][rank 0] ♥ alive | step 401 | GPU 0: 90.4/139.8 GB used
+[18:33:49][rank 1] ♥ alive | step 418 | GPU 1: 90.3/139.8 GB used
+[18:33:50][rank 0] ♥ alive | step 418 | GPU 0: 90.4/139.8 GB used
+[18:34:49][rank 1] ♥ alive | step 435 | GPU 1: 90.3/139.8 GB used
+[18:34:50][rank 0] ♥ alive | step 435 | GPU 0: 90.4/139.8 GB used
+[18:35:41] step 450/32900 ep 0 lr 6.74e-06 loss 0.6643 skipped 6552 rate 0.3 steps/s eta 9.0h ss_p 0.00 GPU0: 90.4GB
+[18:35:49][rank 1] ♥ alive | step 452 | GPU 1: 90.3/139.8 GB used
+[18:35:50][rank 0] ♥ alive | step 452 | GPU 0: 90.4/139.8 GB used
+[18:36:49][rank 1] ♥ alive | step 469 | GPU 1: 90.3/139.8 GB used
+[18:36:50][rank 0] ♥ alive | step 469 | GPU 0: 90.4/139.8 GB used
+[18:37:49][rank 1] ♥ alive | step 486 | GPU 1: 90.3/139.8 GB used
+[18:37:50][rank 0] ♥ alive | step 486 | GPU 0: 90.4/139.8 GB used
+[18:38:38] step 500/32900 ep 0 lr 7.49e-06 loss 0.6436 skipped 6855 rate 0.3 steps/s eta 9.0h ss_p 0.00 GPU0: 90.4GB
+[18:38:49][rank 1] ♥ alive | step 502 | GPU 1: 90.3/139.8 GB used
+[18:38:50][rank 0] ♥ alive | step 502 | GPU 0: 90.4/139.8 GB used
+[18:39:49][rank 1] ♥ alive | step 519 | GPU 1: 90.3/139.8 GB used
+[18:39:50][rank 0] ♥ alive | step 519 | GPU 0: 90.4/139.8 GB used
+[18:40:49][rank 1] ♥ alive | step 536 | GPU 1: 90.3/139.8 GB used
+[18:40:50][rank 0] ♥ alive | step 536 | GPU 0: 90.4/139.8 GB used
+[18:41:37] step 550/32900 ep 0 lr 8.24e-06 loss 0.6016 skipped 7120 rate 0.3 steps/s eta 9.0h ss_p 0.00 GPU0: 90.4GB
+[18:41:49][rank 1] ♥ alive | step 553 | GPU 1: 90.3/139.8 GB used
+[18:41:50][rank 0] ♥ alive | step 553 | GPU 0: 90.4/139.8 GB used
+[18:42:49][rank 1] ♥ alive | step 570 | GPU 1: 90.3/139.8 GB used
+[18:42:50][rank 0] ♥ alive | step 570 | GPU 0: 90.4/139.8 GB used
+[18:43:49][rank 1] ♥ alive | step 587 | GPU 1: 90.3/139.8 GB used
+[18:43:50][rank 0] ♥ alive | step 587 | GPU 0: 90.4/139.8 GB used
+[18:44:35] step 600/32900 ep 0 lr 8.98e-06 loss 0.5645 skipped 7328 rate 0.3 steps/s eta 9.0h ss_p 0.00 GPU0: 90.4GB
+[18:44:49][rank 1] ♥ alive | step 604 | GPU 1: 90.3/139.8 GB used
+[18:44:50][rank 0] ♥ alive | step 604 | GPU 0: 90.4/139.8 GB used
+[18:45:49][rank 1] ♥ alive | step 620 | GPU 1: 90.3/139.8 GB used
+[18:45:50][rank 0] ♥ alive | step 620 | GPU 0: 90.4/139.8 GB used
+[18:46:49][rank 1] ♥ alive | step 637 | GPU 1: 90.3/139.8 GB used
+[18:46:50][rank 0] ♥ alive | step 637 | GPU 0: 90.4/139.8 GB used
+[18:47:33] step 650/32900 ep 0 lr 9.74e-06 loss 0.4529 skipped 7489 rate 0.3 steps/s eta 9.0h ss_p 0.00 GPU0: 90.4GB
+[18:47:49][rank 1] ♥ alive | step 654 | GPU 1: 90.3/139.8 GB used
+[18:47:50][rank 0] ♥ alive | step 654 | GPU 0: 90.4/139.8 GB used
+[18:48:49][rank 1] ♥ alive | step 671 | GPU 1: 90.3/139.8 GB used
+[18:48:50][rank 0] ♥ alive | step 671 | GPU 0: 90.4/139.8 GB used
+[18:49:49][rank 1] ♥ alive | step 688 | GPU 1: 90.3/139.8 GB used
+[18:49:50][rank 0] ♥ alive | step 688 | GPU 0: 90.4/139.8 GB used
+[18:50:31] step 700/32900 ep 0 lr 1.05e-05 loss 0.4084 skipped 7618 rate 0.3 steps/s eta 8.9h ss_p 0.00 GPU0: 90.4GB

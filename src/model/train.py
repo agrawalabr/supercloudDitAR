@@ -9,7 +9,10 @@ Auto-scales to available hardware:
 Design choices:
   - v-prediction diffusion target with cosine β schedule
   - Loss is masked MSE: positions past job end (pred_mask=0) contribute zero
-  - Per-batch outlier guard: if any sample's loss > 5.0, the batch is skipped
+  - Per-sample outlier guard: samples with loss > 5.0 are zeroed out so the
+    rest of the batch still trains. If every sample in a batch is bad (NaN
+    after masking), both DDP ranks coordinate via all_reduce and skip backward
+    together — a one-sided skip would desync the gradient all_reduce and hang.
   - EMA of model weights (decay 0.999) — inference uses EMA exclusively
   - "Scheduled noise" exposure-bias mitigation in last 20% of training:
     with probability p (ramped 0→0.3), the past-power channel of ctx is
@@ -65,7 +68,7 @@ def _ddp_setup(rank: int, world_size: int) -> None:
         free, total = torch.cuda.mem_get_info(rank)
         free_gb  = free  / 1024**3
         total_gb = total / 1024**3
-        print(f"[rank {rank}] GPU {rank} ({props.name}): {free_gb:.1f} GB free / {total_gb:.1f} GB total", flush=True)
+        print(f"[{_ts()}][rank {rank}] GPU {rank} ({props.name}): {free_gb:.1f} GB free / {total_gb:.1f} GB total", flush=True)
         if free_gb < 1.0:
             raise RuntimeError(
                 f"GPU {rank} has only {free_gb:.2f} GB free — likely a zombie CUDA context "
@@ -188,6 +191,17 @@ def train_one_rank(rank: int, world_size: int, cfg: dict) -> None:
         n_workers = min(16, max(2, (os.cpu_count() or 4) // max(1, world_size)))
     n_workers = int(n_workers)
     prefetch_factor = int(train_cfg.get("prefetch_factor", 2)) if n_workers > 0 else None
+    # When DDP is active, NCCL has already been initialized (dist.init_process_group
+    # runs before this point). Linux's default DataLoader multiprocessing context
+    # is 'fork', which inherits NCCL's sockets and shared-memory handles into the
+    # worker processes. Workers don't use NCCL themselves, but closing inherited
+    # NCCL file-descriptors on worker exit corrupts NCCL in the parent → deadlock.
+    # 'forkserver' starts a clean helper server once (before any NCCL state exists),
+    # then forks workers from that server. Workers never see NCCL handles. Startup
+    # is faster than 'spawn' (workers clone the server's already-imported modules
+    # rather than reimporting from scratch). Cost: one-time dataset pickle per
+    # worker at startup (~60 MB, <10 s); free thereafter with persistent_workers.
+    mp_ctx = "forkserver" if is_ddp and n_workers > 0 else None
     loader = DataLoader(
         ds, batch_size=train_cfg["batch_size"],
         shuffle=(sampler is None),
@@ -198,6 +212,7 @@ def train_one_rank(rank: int, world_size: int, cfg: dict) -> None:
         collate_fn=cE._collate_v5,
         persistent_workers=n_workers > 0,
         prefetch_factor=prefetch_factor,
+        multiprocessing_context=mp_ctx,
     )
     if main:
         print(f"[{_ts()}][rank {rank}] dataloader: batch_size={train_cfg['batch_size']} "
@@ -252,9 +267,50 @@ def train_one_rank(rank: int, world_size: int, cfg: dict) -> None:
             print(f"[{_ts()}][rank {rank}] resumed from {last_ckpt} "
                   f"at step {global_step}, epoch {start_epoch}", flush=True)
 
+    # ── GPU keepalive + DataLoader pre-start ──────────────────────────────────
+    # DataLoader workers are launched lazily on the first iter() call. We kick
+    # them off NOW so their parquet-loading startup overlaps with GPU warmup
+    # instead of counting against the first training step.
+    # Without this: GPU sits at 0% for 1–3 min while workers init → job
+    # termination risk on schedulers that monitor GPU utilisation.
+    if n_workers > 0:
+        _pre_iter = iter(loader)   # triggers forkserver to fork workers
+        print(f"[{_ts()}][rank {rank}] DataLoader workers launched (pre-start)", flush=True)
+    else:
+        _pre_iter = None
+
+    if device.type == "cuda":
+        _wu_m, _wu_s = cfg["model"], cfg["sequence"]
+        _B_wu = min(16, train_cfg["batch_size"])
+        _wu_dur = float(train_cfg.get("gpu_warmup_secs", 90))
+        print(
+            f"[{_ts()}][rank {rank}] GPU keepalive: running dummy forward passes "
+            f"for {_wu_dur:.0f}s while DataLoader workers initialize...", flush=True,
+        )
+        raw_net.eval()
+        with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
+            _wu_ctx  = torch.zeros(_B_wu, _wu_m["n_channels"],     _wu_s["W_ctx"],  device=device)
+            _wu_aux  = torch.zeros(_B_wu, _wu_m["n_aux_channels"], _wu_s["W_pred"], device=device)
+            _wu_xn   = torch.zeros(_B_wu, 1,                       _wu_s["W_pred"], device=device)
+            _wu_t    = torch.zeros(_B_wu, device=device, dtype=torch.long)
+            _wu_cond = torch.zeros(_B_wu, _wu_m["cond_dim"],                        device=device)
+            _wu_end  = time.time() + _wu_dur
+            while time.time() < _wu_end:
+                raw_net(_wu_ctx, _wu_aux, _wu_xn, _wu_t, _wu_cond)
+            torch.cuda.synchronize()
+            del _wu_ctx, _wu_aux, _wu_xn, _wu_t, _wu_cond
+        raw_net.train()
+        torch.cuda.empty_cache()
+        print(f"[{_ts()}][rank {rank}] GPU keepalive done — workers should be ready", flush=True)
+
     # ── Training loop ────────────────────────────────────────────────────────
     n_epochs = train_cfg["n_epochs"]
-    steps_per_epoch = len(loader)
+    # max_steps_per_epoch caps how many batches we consume per epoch.
+    # The DataLoader shuffle (seeded by epoch via sampler.set_epoch) gives a
+    # fresh random subset each epoch, so the model sees different data every
+    # pass even though not all 26 M chunks are visited in one epoch.
+    _max_spe = train_cfg.get("max_steps_per_epoch", None)
+    steps_per_epoch = min(len(loader), _max_spe) if _max_spe else len(loader)
     total_steps = n_epochs * steps_per_epoch
     warmup = train_cfg.get("warmup_steps", 2000)
     grad_clip = train_cfg.get("grad_clip", 1.0)
@@ -352,7 +408,10 @@ def train_one_rank(rank: int, world_size: int, cfg: dict) -> None:
 
             epoch_stop = False
             first_batch_done = False
-            for batch in loader:
+            for _epoch_step, batch in enumerate(loader):
+                # Both DDP ranks hit this at the same _epoch_step → no desync.
+                if _max_spe is not None and _epoch_step >= _max_spe:
+                    break
                 ctx        = batch["ctx"].to(device, non_blocking=True)         # (B, n_ch, W_ctx)
                 future_aux = batch["future_aux"].to(device, non_blocking=True)  # (B, 3, W_pred)
                 target     = batch["target"].to(device, non_blocking=True)      # (B, 1, W_pred)
@@ -559,6 +618,15 @@ def run(cfg: dict) -> int:
     # libgomp (GNU OpenMP) used by PyTorch on Linux. Switch to GNU threading
     # before spawning so all child processes inherit the correct setting.
     os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
+
+    # Persist torch.compile / Inductor kernel cache to NFS scratch so it
+    # survives across SLURM jobs and different compute nodes.  On a cache hit
+    # the compile warmup drops from ~15 min to ~30 s (CUDA context init only).
+    _proj_root = Path(__file__).resolve().parent.parent.parent
+    _cache_dir = _proj_root / ".torch_compile_cache"
+    _cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(_cache_dir))
+    os.environ.setdefault("TORCH_COMPILE_DEBUG", "0")  # suppress debug dumps
 
     # Pick a free port once here, before spawning. All worker processes inherit
     # the environment and will agree on this port. Using setdefault lets an

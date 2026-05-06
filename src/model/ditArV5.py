@@ -22,6 +22,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -273,6 +274,13 @@ class DiT_AR_v5(nn.Module):
         # ── Final layer (predicts only on the pred positions) ──
         self.final = FinalLayer(d, self.P)
 
+        # Gradient checkpointing: recomputes each DiT block during backward
+        # instead of storing all intermediate activations. Reduces activation
+        # VRAM from O(n_layers × B × N × d) to O(n_layers × B × N × d / n_layers)
+        # = O(B × N × d) checkpoint boundaries only. Mandatory for B > ~300 on
+        # H200 (139 GB), allows B up to ~2048+ on H200.
+        self.use_checkpoint = cfg.get("use_checkpoint", False)
+
         # General init
         self.apply(self._init_weights)
         # Re-zero AdaLN modulation/output after generic init pass
@@ -332,8 +340,16 @@ class DiT_AR_v5(nn.Module):
         c_vec = self.t_embed(t) + self.c_embed(cond)                # (B, d)
 
         # ── Transformer trunk ──
-        for blk in self.blocks:
-            h = blk(h, c_vec)
+        # With use_checkpoint=True each block's intermediate activations are
+        # discarded and recomputed during backward (O(1) activation storage
+        # per block) — essential for large B on H200. use_reentrant=False is
+        # required for compatibility with torch.compile and DDP.
+        if self.use_checkpoint:
+            for blk in self.blocks:
+                h = gradient_checkpoint(blk, h, c_vec, use_reentrant=False)
+        else:
+            for blk in self.blocks:
+                h = blk(h, c_vec)
 
         # ── Slice out only the pred-region tokens ──
         # Layout: [cond(1), ctx(N_ctx), aux(N_pred), pred(N_pred)]

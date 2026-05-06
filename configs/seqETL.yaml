@@ -17,9 +17,9 @@ channels:
     norm: log1p_zscore      
 
 sequence:
-  W_ctx:  2048
-  W_pred: 1024
-  stride: 1024
+  W_ctx:  16384  # 16384 × 0.103 s ≈ 28 min context window
+  W_pred: 8192   # 8192  × 0.103 s ≈ 14 min prediction window; stride=W_pred keeps
+  stride: 8192   # training & inference distributions identical (non-overlapping windows)
   patch_size: 16
 
 normalization:

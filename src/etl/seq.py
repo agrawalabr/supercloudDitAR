@@ -383,5 +383,46 @@ class SeqETL:
         return 1 if bad else 0
         
 
+    def rebuild_chunks_only(self) -> int:
+        """Fast chunk-index rebuild — skips Phases 3 and 4 (norm stats + NPY
+        conversion).  Call this when only stride / W_ctx / W_pred changed and
+        all NPY files already exist.  Reads job metadata from the existing
+        *_jobs.parquet files (which carry the pre-computed `length` column).
+
+        Returns 0 on success, 1 on any error.
+        """
+        t0 = time.time()
+        cmp = self.storage.get("parquet_compression", "zstd")
+
+        for kind in ("train", "test"):
+            jobs_path = self._rp(self.paths[f"{kind}_chunks"]).with_name(
+                self._rp(self.paths[f"{kind}_chunks"]).stem.replace("chunks", "jobs")
+                + ".parquet"
+            )
+            if not jobs_path.is_file():
+                print(f"ERROR: {jobs_path} not found — run full SeqETL first.")
+                return 1
+
+            jobs_df = pd.read_parquet(jobs_path)
+            # lengths dict: {job_id: length}
+            lengths = dict(zip(jobs_df["job_id"].astype(str), jobs_df["length"].astype(int)))
+
+            jobs_out, chunks_out = self._build_chunk_index(jobs_df, lengths, kind)
+
+            chunks_path = self._rp(self.paths[f"{kind}_chunks"])
+            chunks_out.to_parquet(chunks_path, index=False, compression=cmp)
+            jobs_out.to_parquet(jobs_path,     index=False, compression=cmp)
+            print(f"  Wrote {chunks_path} ({len(chunks_out):,} chunks)")
+
+        print(f"rebuild_chunks_only done in {time.time()-t0:.1f}s")
+        return 0
+
+
 if __name__ == "__main__":
-    sys.exit(SeqETL().run())
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--chunks-only", action="store_true",
+                    help="Rebuild chunk index only (skip norm stats + NPY conversion)")
+    args = ap.parse_args()
+    etl = SeqETL()
+    sys.exit(etl.rebuild_chunks_only() if args.chunks_only else etl.run())
