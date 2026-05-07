@@ -107,7 +107,7 @@ The model is a **diffusion transformer** with:
 
 **Training** (`src/model/train.py`): masked MSE respecting job length (`pred_mask`), AdamW with warmup+cosine decay, gradient clipping, CFG-style conditioning dropout, **EMA** of weights, optional **scheduled sampling** noise injection on past power in late epochs, **mixed precision** (bf16 when supported), and **DDP** when multiple GPUs are visible. Checkpoints use atomic writes; **`ema.pt`** is preferred for downstream inference.
 
-**Inference** (`src/model/inference.py`): **sliding-window autoregressive** rollout with **DDIM** and optional **classifier-free guidance**; denormalization uses `norm_stats.npz`.
+**Inference** (`src/model/inference.py`): Loads **`ema.pt`** (fallback **`last.pt`**) and **`norm_stats.npz`** (power channel \(\log(1+x)\) mean/std). Reads **`test_jobs.parquet`** with optional **`subsample_n`** / **`subsample_stratify_cols`**. For each job: load truth **NPY** \((4,L)\), build SLURM **`cond`** from configured columns; **autoregressive sliding windows** — real future **aux** (3 channels), **generated** past **power** in context after window 0 — each window denoised with **DDIM** (`ddim_steps`, \(\eta=0\)) and **CFG** (`cfg_scale`). Writes **`{inference_dir}/synth/{job_id}.npy`** (generated power in **normalized / z-score space**, same convention as training channel 3). **Scores:** per-job **Pearson \(r\)**, **RMSE**, **MAE** on **denormalized watts** (`expm1(z\cdot\sigma+\mu)\)); logged columns **`job_id`**, **`length`**, **`duration_min`**; everything appended to **`summary.csv`**; stdout prints mean/median \(r\), **`frac>0.30`**, mean/median RMSE/MAE. **Plots:** **`samples.png`** (`plot_n_samples`, default 6) — jobs sampled across **`duration_sec`** when present; stacked panels of real vs generated power (W) with per-panel \(r\), duration, **`nodes_req`**, mean/max watts (matplotlib **Agg**). Optional **`trace_{job_id}.csv`** (`save_per_job_traces`): timestep, **`real_power_W`**, **`synthetic_power_W`**.
 
 Tensor shapes, token layout, and block connectivity are shown schematically in **Appendix B (Figure B‑1)**.
 
@@ -128,7 +128,7 @@ Tensor shapes, token layout, and block connectivity are shown schematically in *
 | Dataset | `src/etl/chunk.py` | mmap-backed `PowerTraceDataset` |
 | Training driver | `src/model/train.py` | DDP, AMP, logging, checkpoints |
 | Thin launcher | `src/model/main.py` | Loads `configs/v5.yaml`, invokes training |
-| Inference | `src/model/inference.py` | Metrics + plots |
+| Inference | `src/model/inference.py` | AR + DDIM + CFG generation; **`summary.csv`** metrics; **`samples.png`** |
 | HW probe | `src/shared/detect_hw.py` | CPU/GPU discovery |
 | Batch scripts | `scripts/train.sh`, `scripts/inference.sh` | Example SLURM submission |
 | Interactive helper | `scripts/terminal.sh` | tmux / Jupyter tunnel workflow |
@@ -139,20 +139,21 @@ Tensor shapes, token layout, and block connectivity are shown schematically in *
 
 ## 6. Evaluation protocol
 
-### 6.1 Metrics
+### 6.1 Metrics (inference driver)
 
-For each test job with generated power \(\hat{p}\) and measured power \(p\) (both in **watts** after denormalization):
+For each successfully generated test job, **`inference.py`** compares denormalized **watts** along the **generated length** (truth truncated to match):
 
-- **Pearson correlation** \(r\) along the overlapping length (undefined when variance is negligible).  
-- **RMSE** \(\sqrt{\mathbb{E}[(p-\hat{p})^2]}\).  
-- **MAE** \(\mathbb{E}[|p-\hat{p}|]\).
+- **Pearson correlation** \(r\) between aligned real and synthetic series (**NaN** if either side has negligible variance).  
+- **RMSE** \(\sqrt{\frac{1}{T}\sum_t (p_t-\hat{p}_t)^2}\) in watts.  
+- **MAE** \(\frac{1}{T}\sum_t |p_t-\hat{p}_t|\) in watts.
 
-Aggregates (mean/median over jobs, fraction above correlation thresholds) are printed at the end of inference and recorded in **`summary.csv`**.
+**`summary.csv`** (under `paths.inference_dir`) stores one row per job: **`pearson_r`**, **`rmse`**, **`mae`**, **`job_id`**, **`length`** (bins), **`duration_min`** (assuming 0.103 s per bin). After the run, the script prints aggregate **mean/median** Pearson \(r\), **fraction of jobs with \(r>0.30\)** (finite-\(r\) rows only), and **mean/median** RMSE and MAE.
 
-### 6.2 Figures
+### 6.2 Figures and optional traces
 
 - **SLURM ETL:** feature histograms and correlation heatmap (Section 4.2).  
-- **Inference:** **`samples.png`** — multi-panel **real vs generated** power traces for a duration-stratified subset of jobs (`plot_n_samples`, configurable). Optional per-job **`trace_{job_id}.csv`** when `save_per_job_traces` is enabled.
+- **Inference — `samples.png`:** reads **`synth/*.npy`** and ground-truth NPY paths from **`test_jobs`**; selects **`plot_n_samples`** jobs spread across **`duration_sec`** when that column exists; each subplot overlays **Real** vs **Generated** power (W); title includes **`job_id`**, **`nodes_req`**, approximate duration (minutes), panel-wise Pearson \(r\) on **normalized** traces for display, and mean/max W for real vs gen. Saved at **`{inference_dir}/samples.png`** (dpi 120).  
+- **Optional — `trace_{job_id}.csv`:** if **`inference.save_per_job_traces`** is true, per-job CSV with **`timestamp_s`** (bin index \(\times\) 0.103), **`real_power_W`**, **`synthetic_power_W`**.
 
 ### 6.3 Training diagnostics
 
@@ -301,48 +302,109 @@ SeqETL reads GPU Parquet files via **`file_path`** embedded in `slurm_log.parque
 
 **Implementation:** `src/model/ditArV5.py` (`DiT_AR_v5`). **Configuration:** `model:` in `configs/v5.yaml` (`d_model`, `n_heads`, `n_layers`, `mlp_ratio`, `patch_size` \(P\), `W_ctx`, `W_pred`, `cond_dim`, `use_checkpoint`, …).
 
-**Token count.** With \(N_{\mathrm{ctx}} = W_{\mathrm{ctx}}/P\) and \(N_{\mathrm{pred}} = W_{\mathrm{pred}}/P\), the sequence has  
-\(N_{\mathrm{tokens}} = 1 + N_{\mathrm{ctx}} + 2\,N_{\mathrm{pred}}\)  
-(one SLURM **cond** token, context patches, auxiliary patches, noisy-power patches). For the default `v5.yaml` layout (\(W_{\mathrm{ctx}}=16384\), \(W_{\mathrm{pred}}=8192\), \(P=16\)): \(N_{\mathrm{ctx}}=1024\), \(N_{\mathrm{pred}}=512\), hence \(N_{\mathrm{tokens}}=2049\).
+### B.1 The **`cond`** vector (**B × 24**) — what it contains
 
-**Classifier-free guidance (training/inference).** Optional `cond_drop_mask` replaces `cond` with a learned **`null_cond`** vector before both the in-sequence cond token path and the AdaLN **`c_embed`** path (`c_embed` still uses dropped cond; time embedding is unchanged).
+The 24 dimensions are fixed by **`slurm_feature_cols`** in `configs/seqETL.yaml` / `configs/v5.yaml` (they must match). Semantically:
 
-**Gradient checkpointing.** When `use_checkpoint: true`, each `DiTBlock` forward is wrapped in `torch.utils.checkpoint.checkpoint` (`use_reentrant=False`) so activation memory scales roughly with one block depth instead of all layers.
+| Group | Count | Columns | Role |
+|-------|------:|---------|------|
+| **Temporal (cyclical)** | **4** | `hour_sin`, `hour_cos`, `dow_sin`, `dow_cos` | When the job **started** (hour-of-day and day-of-week as sine/cosine pairs — **scheduler calendar time**, not diffusion time). |
+| **Continuous / engineered scalars** | **7** | `mem_unlimited`, `mem_req_scaled`, `nodes_req_is_one`, `nodes_req_log`, `cpus_req_scaled`, `duration_scaled`, `priority_scaled` | Resources and scale-normalized SLURM quantities (quantile-style transforms where noted in ETL). |
+| **Priority tier one-hot** | **3** | `ptier_0`, `ptier_1`, `ptier_2` | Mutually exclusive tier from raw priority thresholds. |
+| **Job type one-hot** | **4** | `type_batch`, `type_interactive`, `type_map`, `type_other` | Mutually exclusive coarse job type. |
+| **State one-hot** | **6** | `state_other`, `state_3`, … `state_11` | Mutually exclusive SLURM state bucket after filtering/mapping in ETL. |
+
+All 24 are **scalar floats** per batch row `cond[b, :]`. The model never receives raw timestamps as integers — only these engineered features.
+
+### B.2 Where **`cond`** goes vs diffusion timestep **`t`**
+
+**Diffusion timestep `t`** (tensor shape **`(B,)`**, dtype **long**) is **not** derived from SLURM. It is the **noise-schedule index** \(t \in \{0,\ldots,T-1\}\) with **`T = diffusion_T`** (default **1000**): “how noisy is the current **`noisy_power`**”. Training samples **`t`** per batch; inference (**DDIM**) queries the network at a sequence of **`t`** values stepping toward **0**. That is **independent** of the four SLURM “temporal” features above (which encode **job start** wall-clock structure).
+
+**Two parallel uses of SLURM `cond`:**
+
+1. **In-sequence token — `cond_token_proj(cond)`** → **`(B, 1, d)`** prepended as the **first transformer token**. It **attends bidirectionally** with all patch tokens (full cross‑attention context).
+2. **Global AdaLN carrier — `c_embed(cond)`** → **`(B, d)`**, combined with diffusion time only:
+
+\[
+\mathbf{c}_{\mathrm{vec}} = \underbrace{\texttt{t\_embed}(t)}_{\text{sinusoidal } t \text{ → MLP → } \mathbb{R}^d} + \underbrace{\texttt{c\_embed}(\texttt{cond})}_{\text{SLURM → LayerNorm/SiLU/Linear → } \mathbb{R}^d}
+\]
+
+**`\mathbf{c}_{\mathrm{vec}}`** is the **`c_vec`** passed into **every `DiTBlock`** and the **`FinalLayer`**: each block’s **AdaLN‑Zero** modulation (shift/scale/gate for attention and MLP) is predicted from **`c_vec`**. So SLURM affects **how** layers rescale activations **at every depth**, while the **cond token** additionally injects schedule/job identity as **explicit sequence content**.
+
+**Summary:** **`t`** = diffusion process step; **`cond`** = job metadata (including start-time harmonics). **`c_vec`** = **joint embedding of “which noise level” + “which job type of conditioning”** for modulation.
+
+### B.3 Patch embedding — three **`Conv1d`** heads
+
+Signals stay **`(B, C_{\mathrm{in}}, W)`** (channels-first). Each region uses a **separate** **`nn.Conv1d`** with **`kernel_size = stride = P`** and **no padding**:
+
+| Head | `C_in` | Input span | Output before transpose |
+|------|--------|------------|-------------------------|
+| **`ctx_patch`** | **4** | \(W_{\mathrm{ctx}}\) bins | **`(B, d, N_{\mathrm{ctx}})`** |
+| **`aux_patch`** | **3** | \(W_{\mathrm{pred}}\) bins | **`(B, d, N_{\mathrm{pred}})`** |
+| **`pred_patch`** | **1** | \(W_{\mathrm{pred}}\) bins | **`(B, d, N_{\mathrm{pred}})`** |
+
+Then each is transposed to **`(B, N, d)`** with \(N \in \{N_{\mathrm{ctx}}, N_{\mathrm{pred}}\}\). This is **non-overlapping patching**: each token summarizes **\(P\)** consecutive time bins. **`d = d_model`**.
+
+**Positional encoding:** After projection, **learned** **`pos_ctx`**, **`pos_aux`**, **`pos_pred`** (each **`(1, N_{\mathrm{region}}, d)`**) are **added** so the model knows **region** (history vs future-aux vs noisy-target) and **patch index** within the region. The SLURM cond token has **no** additive position embedding.
+
+### B.4 Token layout and **`N_{\mathrm{tokens}}`**
+
+With \(N_{\mathrm{ctx}} = W_{\mathrm{ctx}}/P\), \(N_{\mathrm{pred}} = W_{\mathrm{pred}}/P\):
+
+\[
+N_{\mathrm{tokens}} = 1 + N_{\mathrm{ctx}} + 2N_{\mathrm{pred}}
+\]
+
+(order: **`[ cond_token \| ctx_tokens \| aux_tokens \| pred_tokens ]`**).
+
+**Default `v5.yaml`** (\(W_{\mathrm{ctx}}=16384\), \(W_{\mathrm{pred}}=8192\), \(P=16\)): \(N_{\mathrm{ctx}}=1024\), \(N_{\mathrm{pred}}=512\) → **2049** tokens.
+
+**Trunk:** **`n_layers`** × **`DiTBlock`** — each block is **pre-norm LayerNorm** (no affine weights), **multi-head self-attention** (`scaled_dot_product_attention`), and **MLP** (\(\approx\) **mlp_ratio × d** hidden), both branches **modulated by AdaLN‑Zero from `c_vec`**.
+
+**Head:** slice tokens **`pred_start = 1 + N_{\mathrm{ctx}} + N_{\mathrm{pred}}`** … end → **`FinalLayer`** (AdaLN + linear **d → P**) → reshape → **`v_pred`** **`(B, 1, W_{\mathrm{pred}})`**.
+
+### B.5 CFG null embed and checkpointing
+
+**Classifier-free guidance:** Optional **`cond_drop_mask`** replaces **`cond`** with learned **`null_cond`** **before** **`cond_token_proj`** and **`c_embed`** (diffusion **`t_embed`** unchanged).
+
+**Gradient checkpointing:** When **`use_checkpoint: true`**, each **`DiTBlock`** forward is recomputed in backward pass (**`use_reentrant=False`** for DDP / compile compatibility).
+
+### Figure B‑1 — schematic forward dataflow
 
 ```mermaid
 flowchart TB
   subgraph inps [Inputs one forward pass]
-    ctx["ctx — B × 4 × W_ctx past multichannel context"]
-    aux["future_aux — B × 3 × W_pred util + mem MiB"]
-    xnoisy["noisy_power — B × 1 × W_pred diffusion state"]
-    cond["cond — B × 24 SLURM features"]
-    tstep["t — B diffusion indices"]
+    ctx["ctx — B × 4 × W_ctx"]
+    aux["future_aux — B × 3 × W_pred"]
+    xnoisy["noisy_power — B × 1 × W_pred"]
+    cond["cond — B × 24 SLURM engineered"]
+    tstep["t — B integers in 0 .. T-1 diffusion timestep"]
   end
 
-  subgraph patch [Patch embed — separate Conv1d, kernel P, stride P]
-    tok_ctx["ctx tokens — B × N_ctx × d"]
-    tok_aux["aux tokens — B × N_pred × d"]
-    tok_pr["pred tokens — B × N_pred × d"]
+  subgraph patch [Patch embed — three Conv1d P×P, stride P]
+    tok_ctx["ctx tokens B × N_ctx × d"]
+    tok_aux["aux tokens B × N_pred × d"]
+    tok_pr["pred tokens B × N_pred × d"]
   end
 
-  subgraph globcond [Global conditioning vector]
-    cvec["c_vec = t_embed(t) + c_embed(cond) — B × d"]
-    ctok["cond token — B × 1 × d via cond_token_proj"]
+  subgraph globcond [Conditioning split]
+    cvec["c_vec = t_embed(t) + c_embed(cond) — B × d — AdaLN only"]
+    ctok["cond_token = cond_token_proj(cond) — B × 1 × d — sequence"]
   end
 
   subgraph assemble [Sequence assembly]
-    pos["+ learned pos_emb per region"]
-    cat["concat on length: cond | ctx | aux | pred"]
+    pos["+ pos_ctx, pos_aux, pos_pred"]
+    cat["concat: cond_token | ctx | aux | pred"]
   end
 
   subgraph trunk [Transformer — n_layers DiTBlock]
-    blk["each block: LayerNorm + AdaLN-Zero(c_vec) + MHA + MLP"]
+    blk["AdaLN-Zero(c_vec): MHA + MLP per block"]
   end
 
-  subgraph out [Prediction head]
-    slc["slice pred-region tokens — B × N_pred × d"]
-    fin["FinalLayer: AdaLN-Zero(c_vec) + Linear → patch logits"]
-    vpred["v_pred — B × 1 × W_pred v-parameterization"]
+  subgraph out [Output head]
+    slc["slice last N_pred tokens"]
+    fin["FinalLayer(c_vec) → patch logits"]
+    vpred["v_pred B × 1 × W_pred"]
   end
 
   ctx --> tok_ctx
@@ -364,7 +426,9 @@ flowchart TB
   fin --> vpred
 ```
 
-**Training vs inference.** The same forward map produces **`v_pred`**; the loss compares **`v_pred`** to the diffusion target **`v`** derived from clean power and noise (`DiffusionSchedule` in-code). At inference, **`inference.py`** repeatedly calls the network inside a **DDIM** loop to obtain denoised power for each AR window.
+### B.6 Training vs inference
+
+The same forward map emits **`v_pred`**; training matches **`v`** from **`DiffusionSchedule`** (**cosine** \(\beta\), **v‑prediction**). Inference (**`inference.py`**) calls this forward inside **DDIM** loops per AR window.
 
 ---
 
@@ -408,7 +472,10 @@ Spot-check `job_id` overlap between exports; no checksum tooling is provided.
 
 ### C.5 Inference outputs
 
-Per-job **`pearson_r`**, **`rmse`**, **`mae`** in `summary.csv`; **`synth/*.npy`** (normalized space); **`samples.png`** for qualitative review.
+- **`synth/{job_id}.npy`** — generated **power only**, **z-score / normalized** space (matches training target channel).  
+- **`summary.csv`** — **`pearson_r`**, **`rmse`**, **`mae`** (watts), **`job_id`**, **`length`**, **`duration_min`**; plus stdout aggregates (mean/median \(r\), **`frac>0.30`**, RMSE/MAE).  
+- **`samples.png`** — qualitative **real vs generated** overlays (`plot_n_samples`, duration-stratified picks).  
+- **`trace_{job_id}.csv`** (optional) — aligned watt traces vs time.
 
 ---
 
