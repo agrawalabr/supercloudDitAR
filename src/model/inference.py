@@ -11,15 +11,21 @@ For each evaluation job:
   5. Compute metrics vs. ground-truth: Pearson r, RMSE, watt MAE
 
 Configurable:
-  - max_windows_per_job: cap inference at first N windows
+  - max_windows_per_job: cap inference at first N windows; if null, use each job's
+    duration_sec with bin spacing 0.103 s: ceil(duration_sec / (W_pred × 0.103))
   - subsample: stratified sampling of test jobs (e.g., 1000)
   - cfg_scale: classifier-free guidance scale (default 1.5)
   - ddim_steps: number of DDIM steps (default 50)
+  - io_prefetch_workers: use 0 to load each job synchronously on the main thread;
+    any positive value enables one background thread so the next NPY overlaps GPU AR
+  - skip_existing_synth: when true (default), skip GPU AR if synth/<job_id>.npy exists;
+    reload metrics vs ground truth so summary.csv stays complete
 """
 from __future__ import annotations
 import argparse, math, os, sys, time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend for HPC/batch jobs
@@ -33,20 +39,69 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ditArV5 as M
 
+# Seconds per histogram bin (matches seqETL / plotting in this module).
+BIN_DT_SEC = 0.103
+
+
+def _set_cuda_throughput_flags() -> None:
+    """Bias runtime toward GPU math over host-side prep (fixed-ish shapes at inference)."""
+    if not torch.cuda.is_available():
+        return
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+
+class _JobLoad(NamedTuple):
+    ok: bool
+    job_id: str
+    arr: Optional[np.ndarray]
+    max_windows: int
+    cond: Optional[np.ndarray]
+    err: Optional[str]
+
+
+def _load_inference_job_cpu(
+    idx: int,
+    job_ids_np: np.ndarray,
+    paths_np: np.ndarray,
+    cond_np: np.ndarray,
+    dur_np: Optional[np.ndarray],
+    *,
+    W_pred: int,
+    max_windows_from_duration: bool,
+    max_windows_fixed: Optional[int],
+) -> _JobLoad:
+    """Blocking load + validation in a worker thread; GPU work stays on the main thread."""
+    jid = str(job_ids_np[idx])
+    try:
+        arr = np.load(paths_np[idx], mmap_mode="r")
+    except Exception as e:
+        return _JobLoad(False, jid, None, 0, None, f"load: {e}")
+    if arr.ndim != 2 or arr.shape[0] != 4:
+        return _JobLoad(False, jid, None, 0, None, f"shape {arr.shape}")
+    arr = np.asarray(arr, dtype=np.float32)
+
+    if max_windows_from_duration:
+        if dur_np is not None:
+            dur = float(dur_np[idx])
+            if not math.isnan(dur):
+                max_windows = max(1, math.ceil(dur / (W_pred * BIN_DT_SEC)))
+            else:
+                max_windows = max(1, math.ceil(arr.shape[1] / W_pred))
+        else:
+            max_windows = max(1, math.ceil(arr.shape[1] / W_pred))
+    else:
+        max_windows = int(max_windows_fixed)
+
+    return _JobLoad(True, jid, arr, max_windows, cond_np[idx].copy(), None)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DDIM sampler with CFG
 # ─────────────────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def ddim_sample(net: torch.nn.Module,
-sched: M.DiffusionSchedule,
-    ctx: torch.Tensor,             # (B, n_ch, W_ctx)
-    future_aux: torch.Tensor,      # (B, 3, W_pred)
-    cond: torch.Tensor,            # (B, cond_dim)
-    n_steps: int = 50,
-    cfg_scale: float = 1.5,
-    eta: float = 0.0,
-) -> torch.Tensor:
+def ddim_sample(net: torch.nn.Module, sched: M.DiffusionSchedule, ctx: torch.Tensor, future_aux: torch.Tensor, cond: torch.Tensor, n_steps: int = 50, cfg_scale: float = 1.5, eta: float = 0.0) -> torch.Tensor:
     """Returns predicted x_0 of shape (B, 1, W_pred)."""
     device = ctx.device
     B = ctx.size(0)
@@ -286,6 +341,7 @@ def run(cfg: dict, ckpt_dir: str = None) -> int:
     # ── Device + checkpoint ──
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    _set_cuda_throughput_flags()
 
     ckpt_dir = ckpt_dir if ckpt_dir else paths["ckpt_dir"]
 
@@ -319,48 +375,131 @@ def run(cfg: dict, ckpt_dir: str = None) -> int:
     test_jobs = pd.read_parquet(paths["test_jobs"])
     print(f"Loaded {len(test_jobs):,} test jobs")
     n_subsample = inf_cfg.get("subsample_n")
-    if n_subsample and n_subsample < len(test_jobs):
+
+    # Determine if subsample_n is None or not. If None, use the full test set.
+    if n_subsample is None:
+        n_subsample_val = len(test_jobs)
+    else:
+        n_subsample_val = n_subsample
+
+    if n_subsample_val < len(test_jobs):
         test_jobs = stratified_subsample(
-            test_jobs, n_subsample,
+            test_jobs, n_subsample_val,
             stratify_cols=inf_cfg.get("subsample_stratify_cols", []),
             seed=inf_cfg.get("seed", 42),
         )
         print(f"Subsampled to {len(test_jobs):,} jobs")
 
     # ── Per-job loop ──
-    max_windows = int(inf_cfg.get("max_windows_per_job", 25))
+    W_pred = int(seq_cfg["W_pred"])
+    if "max_windows_per_job" not in inf_cfg:
+        max_windows_fixed, max_windows_from_duration = 25, False
+    elif inf_cfg["max_windows_per_job"] is None:
+        max_windows_fixed, max_windows_from_duration = None, True
+    else:
+        max_windows_fixed = int(inf_cfg["max_windows_per_job"])
+        max_windows_from_duration = False
+
     n_steps = int(inf_cfg.get("ddim_steps", 50))
     cfg_scale = float(inf_cfg.get("cfg_scale", 1.5))
     save_traces = bool(inf_cfg.get("save_per_job_traces", False))
 
+    slurm_cols = cfg["slurm_feature_cols"]
+    job_ids_np = test_jobs["job_id"].astype(str).to_numpy()
+    paths_np = test_jobs["npy_path"].astype(str).to_numpy()
+    cond_np = test_jobs[slurm_cols].to_numpy(dtype=np.float32)
+    if max_windows_from_duration and "duration_sec" in test_jobs.columns:
+        dur_np = pd.to_numeric(test_jobs["duration_sec"], errors="coerce").to_numpy(dtype=np.float64)
+    else:
+        dur_np = None
+
+    n_jobs = len(job_ids_np)
+    # One overlapping loader keeps the GPU saturated; larger values are ignored.
+    prefetch_enabled = max(0, int(inf_cfg.get("io_prefetch_workers", 1))) > 0
+    skip_existing_synth = bool(inf_cfg.get("skip_existing_synth", True))
+
+    def _synth_exists_for_row(row_i: int) -> bool:
+        return (synth_dir / f"{job_ids_np[row_i]}.npy").is_file()
+
+    def needs_gpu(row_i: int) -> bool:
+        if not skip_existing_synth:
+            return True
+        return not _synth_exists_for_row(row_i)
+
+    gpu_idxs = [i for i in range(n_jobs) if needs_gpu(i)]
+    n_skip = n_jobs - len(gpu_idxs)
+    if skip_existing_synth and n_skip:
+        print(f"Resume: skipping {n_skip:,} jobs with existing synth in {synth_dir}")
+
+    def _kwargs():
+        return dict(
+            job_ids_np=job_ids_np,
+            paths_np=paths_np,
+            cond_np=cond_np,
+            dur_np=dur_np,
+            W_pred=W_pred,
+            max_windows_from_duration=max_windows_from_duration,
+            max_windows_fixed=max_windows_fixed,
+        )
+
     summary = []
     t_start = time.time()
-    for _, row in tqdm(test_jobs.iterrows(), total=len(test_jobs), desc="Generating"):
-        job_id = str(row["job_id"])
-        try:
-            arr = np.load(row["npy_path"], mmap_mode="r")  # (4, L)
-        except Exception as e:
-            print(f"FAIL load {job_id}: {e}")
-            continue
-        if arr.ndim != 2 or arr.shape[0] != 4:
-            print(f"FAIL shape {job_id}: {arr.shape}")
-            continue
 
-        cond = row[cfg["slurm_feature_cols"]].to_numpy(dtype=np.float32)
+    def _consume_existing_disk(row_i: int) -> None:
+        job_id = str(job_ids_np[row_i])
+        synth_path = synth_dir / f"{job_id}.npy"
+        try:
+            gen_z = np.asarray(np.load(synth_path), dtype=np.float32).ravel()
+        except Exception as e:
+            print(f"FAIL reopen synth {job_id}: {e}")
+            return
+        try:
+            arr = np.load(paths_np[row_i], mmap_mode="r")
+        except Exception as e:
+            print(f"FAIL gt load {job_id}: {e}")
+            return
+        if arr.ndim != 2 or arr.shape[0] != 4:
+            print(f"FAIL gt shape {job_id}: {arr.shape}")
+            return
+        real_z = np.asarray(arr[3, : len(gen_z)], dtype=np.float32)
+        real_W = denormalize_power(real_z, log_mean_pwr, log_std_pwr)
+        gen_W = denormalize_power(gen_z, log_mean_pwr, log_std_pwr)
+        m = metrics(real_W, gen_W)
+        m["job_id"] = job_id
+        m["length"] = len(gen_z)
+        m["duration_min"] = len(gen_z) * 0.103 / 60.0
+        summary.append(m)
+
+        if save_traces and not (out_dir / f"trace_{job_id}.csv").is_file():
+            trace_df = pd.DataFrame({
+                "timestamp_s": np.arange(len(gen_z)) * 0.103,
+                "real_power_W": real_W,
+                "synthetic_power_W": gen_W,
+            })
+            trace_df.to_csv(out_dir / f"trace_{job_id}.csv", index=False)
+
+    def _consume_load(load: _JobLoad) -> None:
+        if not load.ok:
+            print(f"FAIL {load.job_id}: {load.err}")
+            return
+        job_id = load.job_id
+        arr = load.arr
+        cond_row = load.cond
+        mw = load.max_windows
+        assert arr is not None and cond_row is not None
 
         gen_z = generate_job(
             net, sched,
-            np.asarray(arr),  # materialize from mmap
-            cond,
-            W_ctx=seq_cfg["W_ctx"], W_pred=seq_cfg["W_pred"], stride=seq_cfg["stride"],
-            max_windows=max_windows, n_steps=n_steps, cfg_scale=cfg_scale,
+            arr,
+            cond_row,
+            W_ctx=seq_cfg["W_ctx"], W_pred=W_pred, stride=seq_cfg["stride"],
+            max_windows=mw, n_steps=n_steps, cfg_scale=cfg_scale,
             device=device,
         )
 
-        # Real power (z-score) → real watts
-        real_z = arr[3, :len(gen_z)]
+        real_z = arr[3, : len(gen_z)]
         real_W = denormalize_power(real_z, log_mean_pwr, log_std_pwr)
-        gen_W  = denormalize_power(gen_z,  log_mean_pwr, log_std_pwr)
+        gen_W = denormalize_power(gen_z, log_mean_pwr, log_std_pwr)
 
         np.save(synth_dir / f"{job_id}.npy", gen_z)
 
@@ -377,6 +516,36 @@ def run(cfg: dict, ckpt_dir: str = None) -> int:
                 "synthetic_power_W": gen_W,
             })
             trace_df.to_csv(out_dir / f"trace_{job_id}.csv", index=False)
+
+    kw = _kwargs()
+    with torch.inference_mode():
+        if prefetch_enabled and len(gpu_idxs) > 0:
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_load_inference_job_cpu, gpu_idxs[0], **kw)
+                gi = 0
+                for i in tqdm(range(n_jobs), desc="Generating"):
+                    if not needs_gpu(i):
+                        _consume_existing_disk(i)
+                        continue
+                    load = fut.result()
+                    assert load.job_id == str(job_ids_np[i])
+                    gi += 1
+                    if gi < len(gpu_idxs):
+                        fut = ex.submit(_load_inference_job_cpu, gpu_idxs[gi], **kw)
+                    _consume_load(load)
+        elif len(gpu_idxs) > 0:
+            gi = 0
+            for i in tqdm(range(n_jobs), desc="Generating"):
+                if not needs_gpu(i):
+                    _consume_existing_disk(i)
+                    continue
+                load = _load_inference_job_cpu(gpu_idxs[gi], **kw)
+                assert load.job_id == str(job_ids_np[i])
+                gi += 1
+                _consume_load(load)
+        else:
+            for i in tqdm(range(n_jobs), desc="Generating"):
+                _consume_existing_disk(i)
 
     elapsed = time.time() - t_start
     summary_df = pd.DataFrame(summary)

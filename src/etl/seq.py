@@ -421,7 +421,15 @@ class SeqETL:
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--chunks-only", action="store_true", help="Rebuild chunk index only (skip norm stats + NPY conversion)")
+    group = ap.add_mutually_exclusive_group(required=True)
+    group.add_argument("--reprocess", action="store_true", help="Reprocess all jobs")
+    group.add_argument("--chunks-only", action="store_true", help="Rebuild chunk index only (skip train/test split + norm stats + NPY conversion)")
     args = ap.parse_args()
     etl = SeqETL()
-    sys.exit(etl.rebuild_chunks_only() if args.chunks_only else etl.run())
+    if args.reprocess:
+        sys.exit(etl.run())
+    elif args.chunks_only:  
+        sys.exit(etl.rebuild_chunks_only())
+    else:
+        print("Invalid argument. Use --reprocess or --chunks-only.")
+        sys.exit(1)

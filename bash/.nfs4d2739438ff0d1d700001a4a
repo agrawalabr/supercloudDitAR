@@ -34,7 +34,7 @@ echo "=== $(/share/apps/anaconda3/2025.06/bin/python3 -c 'import torch; print(f"
 
 echo "=== Starting inference ==="
 /share/apps/anaconda3/2025.06/bin/python3 -u src/model/inference.py \
-    --config configs/v5.yaml --ckpt_dir /scratch/aa9360/supercloud_power/output/v5-8192/ckpt \
+    --config configs/v5.yaml --ckpt_dir /scratch/aa9360/supercloud_power/output/v5/ckpt \
     2>&1 | tee -a output/v5/infer-output.txt
 INFER_EXIT=$?
 

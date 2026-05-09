@@ -32,6 +32,25 @@ def _parquet_ok(args):
     except Exception:
         return False
 
+def _extract_metadata(path):
+    """Extract metadata from the parquet file."""
+    try:
+        raw = pq.read_metadata(path).metadata or {}
+    except Exception:
+        return {}
+    meta = {k.decode(): v.decode() for k, v in raw.items() if not k.startswith(b"pandas")}
+    if "job_id" not in meta:
+        return None
+    dur = float(meta.get("duration_sec", 0))
+    return {
+        "job_id":       meta["job_id"],
+        "nodes_used":   int(meta.get("nodes_used", 0)),
+        "file_path":    str(path.resolve()),
+        "length":       int(meta.get("length", 0)),
+        "duration_sec": dur,
+        "delta_t":      float(meta.get("delta_t", 0))
+    }
+
 
 def _estimate_dt(path, ts_col, n_probe):
     """Mean Δt from first n_probe rows, or None if the file is unreadable."""
@@ -233,7 +252,7 @@ class GpuETL:
         ]
 
     # ── Build gpu_traces.csv from parquet footer metadata (single-threaded) ──
-    def _build_traces(self, od: Path = None, traces_path: Path = None):
+    def _build_traces(self, od: Path = None, traces_path: Path = None, lower_bound_sec: float = None, upper_bound_sec: float = None):
         """Scan every parquet, read embedded trace metadata, and overwrite traces file.
         Since we are scanning every file, always overwrite output traces file.
         Duration bounds (lower_bound_sec / upper_bound_sec) are applied here.
@@ -241,29 +260,22 @@ class GpuETL:
         od = self._rp(self.paths["intermediate"]) if not od else od
         traces_path = self._rp(self.paths["gpu_traces"]) if not traces_path else traces_path
 
-        lower = float(self.processing.get("lower_bound_sec", float("-inf")))
-        upper = float(self.processing.get("upper_bound_sec", float("inf")))
+        lower = lower_bound_sec if lower_bound_sec is not None else float(self.processing.get("lower_bound_sec", float("-inf")))
+        upper = upper_bound_sec if upper_bound_sec is not None else float(self.processing.get("upper_bound_sec", float("inf")))
+        nw  = max(1, (os.cpu_count() or 4) - int(self.processing.get("reserved_cpus", 2)))
 
         rows = []
-        for f in tqdm(sorted(od.glob("*.parquet")), desc="building traces", leave=False):
-            try:
-                raw = pq.read_metadata(f).metadata or {}
-            except Exception:
-                continue
-            meta = {k.decode(): v.decode() for k, v in raw.items() if not k.startswith(b"pandas")}
-            if "job_id" not in meta:
-                continue
-            dur = float(meta.get("duration_sec", 0))
-            if not (lower <= dur <= upper):
-                continue
-            rows.append({
-                "job_id":       meta["job_id"],
-                "nodes_used":   int(meta.get("nodes_used", 0)),
-                "file_path":    str(f.resolve()),
-                "length":       int(meta.get("length", 0)),
-                "duration_sec": dur,
-                "delta_t":      float(meta.get("delta_t", 0)),
-            })
+        with ProcessPoolExecutor(max_workers=nw) as ex:
+            futs = {ex.submit(_extract_metadata, f): f for f in sorted(od.glob("*.parquet"))}
+            with tqdm(total=len(futs), desc="Building traces... (extracting metadata)", leave=False) as pbar:
+                for fu in as_completed(futs):
+                    meta = fu.result()
+                    pbar.update(1)
+                    if meta is None:
+                        continue
+                    if not (lower <= meta["duration_sec"] <= upper):
+                        continue
+                    rows.append(meta)
 
         if rows:
             pd.DataFrame(rows).to_csv(traces_path, mode="w", header=True, index=False)
@@ -338,4 +350,15 @@ class GpuETL:
 
 
 if __name__ == "__main__":
-    sys.exit(GpuETL()._build_traces())
+    import argparse
+    ap = argparse.ArgumentParser()
+    group = ap.add_mutually_exclusive_group(required=True)
+    group.add_argument("--reprocess", action="store_true", help="Reprocess all jobs")
+    group.add_argument("--build_traces", action="store_true", help="Build traces file")
+    args = ap.parse_args()
+    if args.reprocess:
+        etl = GpuETL()
+        sys.exit(etl.run())
+    elif args.build_traces:
+        etl = GpuETL()
+        sys.exit(etl._build_traces())

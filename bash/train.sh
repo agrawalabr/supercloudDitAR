@@ -31,6 +31,7 @@ set -uo pipefail
 PROJ=/scratch/aa9360/supercloud_power
 cd "$PROJ"
 
+PYTHON="${PYTHON:-/share/apps/anaconda3/2025.06/bin/python3}"
 # Create output directory before the job starts (SLURM needs it for --output).
 mkdir -p output/v5
 
@@ -46,11 +47,17 @@ echo "=== Clearing any zombie python processes from previous runs ==="
 pkill -9 -u "$USER" -f 'python.*main' 2>/dev/null || true
 sleep 3   # give CUDA contexts time to be released
 
-echo "=== Rebuilding chunk index (stride/window change — skips NPY re-processing) ==="
-/share/apps/anaconda3/2025.06/bin/python3 -u src/etl/seq.py --chunks-only 2>&1 | tee -a output/v5/output.txt
+read -p "Do you need to rebuild the chunk index? (y/n): " REBUILD_CHUNKS
+
+if [[ "$REBUILD_CHUNKS" =~ ^[Yy]$ ]]; then
+    echo "=== Rebuilding chunk index (stride/window change — skips NPY re-processing) ==="
+    $PYTHON -u src/etl/seq.py --chunks-only 2>&1 | tee -a output/v5/output.txt
+else
+    echo "=== Skipping chunk index rebuild ==="
+fi
 
 echo "=== Starting training ==="
-/share/apps/anaconda3/2025.06/bin/python3 -u src/model/main.py 2>&1 | tee -a output/v5/output.txt
+$PYTHON -u src/model/main.py 2>&1 | tee -a output/v5/output.txt
 TRAIN_EXIT=$?
 
 echo "=== Training exited with code $TRAIN_EXIT at $(date) ==="

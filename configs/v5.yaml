@@ -33,7 +33,8 @@ model:
   n_heads: 6
   n_layers: 12
   mlp_ratio: 4
-  dropout: 0.0
+  dropout: 0.1                   # raised from 0.0 — regularization for 40K-job dataset;
+                                  # reduces overfitting when training for 80 epochs
   patch_size: 16
   W_ctx: 16384
   W_pred: 8192
@@ -42,60 +43,68 @@ model:
   n_aux_channels: 3
   diffusion_T: 1000
   # Gradient checkpointing: recomputes each DiT block during backward instead of
-  # caching its activations. Reduces activation VRAM from O(n_layers) to O(1) —
-  # mandatory on <80 GB GPUs (L40S 44 GB), optional on H200 (141 GB).
-  # Cost: ~2× backward compute. Set false only on H200 for max throughput.
-  use_checkpoint: true
+  # caching its activations. At B=256 the original design comment predicted
+  # ~66 GB total (47% of 139 GB H200) without checkpointing — safe headroom.
+  # Disabling gives ~2× faster backward (no recompute). Re-enable if OOM.
+  use_checkpoint: false
 
 # ── Training hyperparameters ────────────────────────────────────────────────
+# Dataset: ~40K jobs (5 min – 2 hr), 124,629 train chunks (250K with stride=4096).
+# Per-GPU steps: chunks ÷ 2 GPUs ÷ batch_size.
+#   B=256, stride=8192 → 124,629÷2÷256 = 243 steps/epoch → 80 epochs = 19,440 total
+#   B=256, stride=4096 → ~250K÷2÷256  = 488 steps/epoch → 50 epochs = 24,400 total (Phase 2)
 train:
-  batch_size: 1024                # per-GPU (effective 2048 across 2× H200 with DDP).
-                                  # use_checkpoint=true stores only 12 block-input boundaries
-                                  # (~20 GB) + peak for one block recompute (~20 GB) = ~42 GB
-                                  # total (30% of 139 GB). Safe and GPU-heavy.
-  n_epochs: 20
-  lr: 1.5e-5                      # halved from 3e-5 — previous run diverged at step ~8000
-                                  # with grad_clip=0.5; lower LR reduces per-step gradient
-                                  # magnitude so clip is less likely to be insufficient.
-  weight_decay: 0.01
-  warmup_steps: 1000              # 1000 steps at effective B=2048: ~2M samples warmup
-  grad_clip: 0.3                  # tightened from 0.5 — previous divergence (step ~8000)
-                                  # suggests 0.5 was insufficient with use_checkpoint=true.
+  batch_size: 256                 # reduced from 1024 → 4× more steps/epoch (60→243).
+                                  # Critical: previous config had only 1,200 total steps
+                                  # with warmup=1000, so 83% of training was warmup and
+                                  # the model never reached full LR. Smaller batch also
+                                  # gives noisier gradients that help escape flat regions
+                                  # on a small 40K-job dataset.
+  n_epochs: 160                    # increased from 20 → ~19,440 total steps.
+                                  # Small dataset needs more passes; diffusion models
+                                  # benefit from 100+ effective epochs over each example.
+  lr: 1.5e-5                      # unchanged — previously stable at this value. Adam
+                                  # is relatively robust to batch-size changes.
+  weight_decay: 0.05              # increased from 0.01 — stronger L2 regularization
+                                  # helps prevent overfitting on the smaller 40K-job set.
+  warmup_steps: 500               # reduced from 1000. Was 83% of old total (1200 steps)!
+                                  # Now ~2.6% of 19,440 — appropriate ramp-up budget.
+  grad_clip: 1.0                  # unchanged — stable with lr=1.5e-5
   cfg_dropout_p: 0.05
-  loss_skip_threshold: 2.0        # tightened from 3.0 — catch outlier samples earlier,
-                                  # preventing bad gradients from accumulating before zeroing.
-  max_steps_per_epoch: null       # see all ~3 285 steps/epoch (3 370 841 ÷ 2 GPUs ÷ 1024).
-                                  # 100% of data every epoch.
-  log_every: 50
-  ckpt_every_steps: 500
+  loss_skip_threshold: 20.0       # only masks true NaN/Inf outliers (~0.06% of samples)
+  max_steps_per_epoch: null       # 124,629 chunks ÷ 2 GPUs ÷ 256 = 243 steps/epoch.
+                                  # (Phase 2: ~250K chunks with stride=4096 → 488 steps/epoch)
+  log_every: 100                  # every 100 steps (~every 0.4 epochs at B=256)
+  ckpt_every_steps: 1000          # checkpoint every ~4 epochs
   ema_decay: 0.9999
-  num_workers: 4                  # 4 workers per rank (was 16). Fewer workers = 4× faster
-                                  # DataLoader startup (forkserver only needs to fork 4 procs
-                                  # instead of 16; each takes ~30 s to init parquet index).
-                                  # Still sufficient: at B=1024 each step takes ~300 ms so
-                                  # workers have plenty of time to prefetch ahead.
-  prefetch_factor: 8              # 4 workers × 8 prefetch = 32 batches buffered; hides any
-                                  # remaining I/O latency and keeps GPU fed continuously.
-  compile: false                  # Disabled: torch.compile causes 5-20 min of 0% GPU
-                                  # utilisation on first run (kernel tracing), which triggers
-                                  # idle-GPU node termination on Supercloud. H200 is fast
-                                  # enough without it. Re-enable once compile cache is warm.
+  gpu_warmup_secs: 30
+  num_workers: 4
+  prefetch_factor: 8
+  compile: false                  # torch.compile causes 5-20 min 0% GPU on first run
+                                  # (kernel tracing) → idle-GPU node kill on Supercloud.
 
-  # Scheduled-noise exposure-bias mitigation (final 20% of epochs)
-  scheduled_sampling_p_max: 0.3
+  # Scheduled-noise exposure-bias mitigation
+  # Starts at epoch 32/80 (= frac 0.40) — after model has learned coarse structure.
+  scheduled_sampling_start_frac: 0.40  # was 0.45 (epoch 9/20); keep same relative timing
+  scheduled_sampling_p_max: 0.4        # raised from 0.3 — 40K-job dataset benefits from
+                                        # stronger exposure-bias correction
   scheduled_sampling_t_min: 50
   scheduled_sampling_t_max: 200
 
 # ── Inference ───────────────────────────────────────────────────────────────
 inference:
-  subsample_n: 30               # null = use full test set
+  subsample_n: null               # null = use full test set
+  plot_n_samples: 10
   subsample_stratify_cols: []
-  max_windows_per_job: 103        # 103 × 8192 bins × 0.103 s ≈ 24.2 h per job
+  max_windows_per_job: null        # 103 × 8192 bins × 0.103 s ≈ 24.2 h per job
                                   # covers 100% of <1hr jobs (≤5 windows) and 100%
                                   # of 1–24hr jobs; first 24hr generated for >24hr jobs
   ddim_steps: 50
-  cfg_scale: 1.5
+  cfg_scale: 3.0                  # raised from 1.5 — low cfg_scale was suppressing the
+                                  # conditional signal (SLURM features). 3.0 amplifies
+                                  # guidance toward the predicted conditional distribution.
   save_per_job_traces: false      # set true to save (timestamp, real, gen) CSVs
+  skip_existing_synth: true       # set true to skip jobs with existing synth .npy files
   seed: 42
 
 # ── SLURM cond columns (must match seqETL.yaml exactly; 24 dims) ────────────

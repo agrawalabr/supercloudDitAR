@@ -1,7 +1,7 @@
 import torch
 import time
 
-def keep_all_gpus_busy():
+def dummy_gpus_hold():
     """
     Keeps all available GPUs (e.g., 8 on LS140 nodes) busy until interrupted by the user.
     Each GPU will have its own busy loop.
@@ -11,22 +11,18 @@ def keep_all_gpus_busy():
 
     def keep_one_gpu_busy(device, gpu_idx):
         print(f"Keeping GPU busy on device: {device} until interrupted (Ctrl+C)")
-        size = 4096  # Large enough to keep the GPU occupied
+        size = 32768  # Large enough to keep the GPU occupied
         x = torch.rand(size, size, device=device)
         y = torch.rand(size, size, device=device)
 
         iter_count = 0
-        try:
-            while True:
-                z = torch.mm(x, y)
-                x = torch.relu(z)
-                iter_count += 1
-                if iter_count % 100 == 0:
-                    print(f"[Device {gpu_idx}] Still busy... iterations: {iter_count//100}s")
-                # Short sleep to avoid watchdog warnings
-                time.sleep(0.1)
-        except KeyboardInterrupt:
-            print(f"\nStopped keeping GPU busy on device: {device}")
+        while True:
+            z = torch.mm(x, y)
+            x = torch.relu(z)
+            iter_count += 1
+            if iter_count % 100 == 0:
+                print(f"[Device {gpu_idx}] Still busy... iterations: {iter_count//100}s")
+            time.sleep(0.1)
 
     if not torch.cuda.is_available():
         print("CUDA is not available, running on CPU (will not occupy multiple GPUs).")
@@ -42,11 +38,8 @@ def keep_all_gpus_busy():
         t = threading.Thread(target=keep_one_gpu_busy, args=(device, i))
         t.start()
         threads.append(t)
-    try:
-        for t in threads:
-            t.join()
-    except KeyboardInterrupt:
-        print("\nInterrupted by user. Exiting...")
+    for t in threads:
+        t.join()
 
 if __name__ == "__main__":
     keep_all_gpus_busy()

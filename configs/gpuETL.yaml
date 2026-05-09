@@ -34,7 +34,7 @@ processing:
   delta_t_max: 0.300           
   outlier_probe_rows: 50
   min_node_keep_ratio: 0.75
-  upper_bound_sec: 864000
+  upper_bound_sec: 7200
   lower_bound_sec: 300
 
 parquet:

@@ -2,7 +2,7 @@ import os
 import torch
 import subprocess
 
-def detect_hw(verbose=False):
+def node_info(verbose=False):
     """Detect and display per-GPU hardware & utilization specs, matching the output style:
     [rank X] GPU N (NAME): Y GB free / Z GB total, U% util / M% mem
     """
@@ -117,5 +117,5 @@ def print_hw_summary(hw_info):
     print(f"BF16 supported: {hw_info['bf16_supported']}")
 
 if __name__ == "__main__":
-    hw = detect_hw(verbose=False)
+    hw = node_info(verbose=False)
     print_hw_summary(hw)

@@ -18,7 +18,12 @@ Design choices:
     with probability p (ramped 0→0.3), the past-power channel of ctx is
     replaced by a noisy version (q_sample with t ∈ [50, 200])
   - CFG dropout at 5%
-  - Resume from latest checkpoint by default
+  - Resume: ``last.pt`` if present else ``final.pt`` (override with ``resume_checkpoint``).
+    New checkpoints (``ckpt_ver >= 2``) store ``epoch`` = index of next epoch to run.
+    Legacy checkpoints treated as completed epoch; load bumps +1 to avoid replay.
+  - Continued training: raise ``n_epochs`` above the stored next-epoch index; optional
+    ``finetune_reset_lr_schedule`` restarts cosine+warmup over remaining epochs; optional
+    ``min_snr_gamma`` enables Hang et al. Min-SNR-γ loss weighting.
 """
 from __future__ import annotations
 import argparse, math, os, sys, time, copy, signal, datetime, threading
@@ -51,20 +56,13 @@ def _find_free_port() -> int:
 
 
 def _ddp_setup(rank: int, world_size: int) -> None:
-    # MASTER_PORT is set by run() before spawning so all workers share the same
-    # pre-validated free port. Fall back to a random port if somehow not set.
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", str(_find_free_port()))
-    # Enable P2P (NVLink) direct GPU-to-GPU copies for NCCL all-reduce on H200.
     os.environ.setdefault("NCCL_P2P_DISABLE", "0")
     os.environ.setdefault("NCCL_IB_DISABLE", "1")  # no InfiniBand on single node
 
-    # Pre-flight: check GPU memory before touching the device. If a previous
-    # run left zombie CUDA contexts, set_device will fail with an opaque OOM.
-    # Report free/total memory so the user knows to kill lingering processes.
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(rank)
-        # This query uses the NVML C API and does NOT require a CUDA context.
         free, total = torch.cuda.mem_get_info(rank)
         free_gb  = free  / 1024**3
         total_gb = total / 1024**3
@@ -74,9 +72,6 @@ def _ddp_setup(rank: int, world_size: int) -> None:
                 f"GPU {rank} has only {free_gb:.2f} GB free — likely a zombie CUDA context "
                 f"from a previous run. Run: pkill -9 -u $USER -f python3"
             )
-
-    # 30-minute NCCL timeout — prevents a hung rank from silently blocking
-    # the whole job and consuming all remaining wall time.
     dist.init_process_group(
         "nccl", rank=rank, world_size=world_size,
         timeout=datetime.timedelta(seconds=1800),
@@ -96,6 +91,11 @@ def _is_main(rank: int) -> bool:
 def _ts() -> str:
     """Current wall-clock time string for log prefixes."""
     return time.strftime("%H:%M:%S")
+
+
+# Checkpoint format >= 2: ``epoch`` field is the index of the *next* epoch to run
+# on resume ([0..n_epochs]). Older checkpoints stored the epoch that had just ended.
+_CKPT_VER = 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -127,11 +127,15 @@ class EMA:
 # ─────────────────────────────────────────────────────────────────────────────
 # LR schedule: warmup + cosine decay
 # ─────────────────────────────────────────────────────────────────────────────
-def _lr_factor(step: int, warmup: int, total: int) -> float:
+def _lr_factor(step: int, warmup: int, total: int, min_factor: float = 0.05) -> float:
+    """Warmup then cosine decay to `min_factor` × peak_lr (not to zero).
+    min_factor=0.05 keeps the last epochs at 5% of peak so they still train.
+    """
     if step < warmup:
         return step / max(1, warmup)
     progress = (step - warmup) / max(1, total - warmup)
-    return 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
+    cosine = 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
+    return min_factor + (1.0 - min_factor) * cosine
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -145,13 +149,9 @@ def train_one_rank(rank: int, world_size: int, cfg: dict) -> None:
 
     # ── CUDA throughput flags ─────────────────────────────────────────────────
     if device.type == "cuda":
-        # cuDNN auto-tunes kernels for fixed input shapes (no cost after warmup).
         torch.backends.cudnn.benchmark = True
-        # TF32 gives ~3× faster fp32 matmuls on Ampere+ with negligible accuracy
-        # loss. Redundant under bf16 autocast but applies to any fp32 fallback.
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        # High precision for matmul reduces to TF32 on Hopper (H200).
         torch.set_float32_matmul_precision("high")
     main = _is_main(rank)
 
@@ -165,7 +165,6 @@ def train_one_rank(rank: int, world_size: int, cfg: dict) -> None:
     else:
         amp_dtype = torch.float32
         use_grad_scaler = False
-    # Print from every rank so the user can confirm all GPUs are initialised.
     print(f"[{_ts()}][rank {rank}] device={device}, amp_dtype={amp_dtype}, world_size={world_size}", flush=True)
 
     # ── Build dataset + dataloader ───────────────────────────────────────────
@@ -187,20 +186,9 @@ def train_one_rank(rank: int, world_size: int, cfg: dict) -> None:
     )
     n_workers = train_cfg.get("num_workers")
     if n_workers is None:
-        # Cap at 16 per rank to stay under OS recommended total of 32
         n_workers = min(16, max(2, (os.cpu_count() or 4) // max(1, world_size)))
     n_workers = int(n_workers)
     prefetch_factor = int(train_cfg.get("prefetch_factor", 2)) if n_workers > 0 else None
-    # When DDP is active, NCCL has already been initialized (dist.init_process_group
-    # runs before this point). Linux's default DataLoader multiprocessing context
-    # is 'fork', which inherits NCCL's sockets and shared-memory handles into the
-    # worker processes. Workers don't use NCCL themselves, but closing inherited
-    # NCCL file-descriptors on worker exit corrupts NCCL in the parent → deadlock.
-    # 'forkserver' starts a clean helper server once (before any NCCL state exists),
-    # then forks workers from that server. Workers never see NCCL handles. Startup
-    # is faster than 'spawn' (workers clone the server's already-imported modules
-    # rather than reimporting from scratch). Cost: one-time dataset pickle per
-    # worker at startup (~60 MB, <10 s); free thereafter with persistent_workers.
     mp_ctx = "forkserver" if is_ddp and n_workers > 0 else None
     loader = DataLoader(
         ds, batch_size=train_cfg["batch_size"],
@@ -219,16 +207,12 @@ def train_one_rank(rank: int, world_size: int, cfg: dict) -> None:
               f"num_workers={n_workers} prefetch_factor={prefetch_factor}", flush=True)
 
     # ── Model + optimizer + EMA ──────────────────────────────────────────────
-    # raw_net holds the original nn.Module — used for EMA, checkpointing, and
-    # optimizer parameters so state dicts stay compatible with/without compile.
     raw_net = M.build_model(cfg["model"]).to(device)
     sched = M.DiffusionSchedule(T=cfg["model"].get("diffusion_T", 1000)).to(device)
     if main:
         print(f"[{_ts()}][rank {rank}] model: {M.count_params(raw_net) / 1e6:.1f}M params", flush=True)
 
-    # Compile before DDP for best kernel fusion; raw_net shares the same weights.
     if train_cfg.get("compile", False) and hasattr(torch, "compile"):
-        # Print from ALL ranks — user can see both GPUs starting to compile.
         print(f"[{_ts()}][rank {rank}] torch.compile wrapping model (kernel tracing "
               f"happens on the FIRST batch — expect 5-20 min of silence per rank)", flush=True)
         net = torch.compile(raw_net)
@@ -251,30 +235,54 @@ def train_one_rank(rank: int, world_size: int, cfg: dict) -> None:
     ckpt_dir = Path(cfg["paths"]["ckpt_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     last_ckpt = ckpt_dir / "last.pt"
+    final_ckpt = ckpt_dir / "final.pt"
 
     start_epoch, global_step = 0, 0
+
+    resume_ckpt = None
     if last_ckpt.is_file():
-        sd = torch.load(last_ckpt, map_location=device)
+        resume_ckpt = last_ckpt
+    elif final_ckpt.is_file():
+        resume_ckpt = final_ckpt
+
+    if resume_ckpt is not None:
+        sd = torch.load(resume_ckpt, map_location=device)
         raw_net.load_state_dict(sd["model"])
         optim.load_state_dict(sd["optim"])
         if ema is not None and "ema" in sd:
             ema.load_state_dict(sd["ema"])
         if scaler is not None and "scaler" in sd and sd["scaler"] is not None:
             scaler.load_state_dict(sd["scaler"])
-        start_epoch = sd.get("epoch", 0)
+        ckpt_ver = int(sd.get("ckpt_ver", 1))
+        raw_ep = int(sd.get("epoch", 0))
         global_step = sd.get("step", 0)
+        if ckpt_ver >= _CKPT_VER:
+            start_epoch = raw_ep
+        else:
+            # Legacy: "epoch" was the index of the epoch that had just finished
+            # when the checkpoint was saved at end-of-epoch — resuming reused that
+            # epoch. Bump by one (cap at n_epochs) so we resume at the next epoch.
+            start_epoch = min(raw_ep + 1, int(train_cfg["n_epochs"]))
+            if main:
+                print(
+                    f"[{_ts()}][rank {rank}] legacy checkpoint (ckpt_ver<2): "
+                    f"mapped stored epoch={raw_ep} → resume next_epoch_index={start_epoch}",
+                    flush=True,
+                )
+        n_epochs_upper = int(train_cfg["n_epochs"])
+        start_epoch = max(0, min(start_epoch, n_epochs_upper))
         if main:
-            print(f"[{_ts()}][rank {rank}] resumed from {last_ckpt} "
-                  f"at step {global_step}, epoch {start_epoch}", flush=True)
+            remaining = max(0, n_epochs_upper - start_epoch)
+            print(
+                f"[{_ts()}][rank {rank}] resumed from {resume_ckpt} "
+                f"at step={global_step}, next_epoch_index={start_epoch}/{n_epochs_upper} "
+                f"({remaining} epoch slots left)",
+                flush=True,
+            )
 
     # ── GPU keepalive + DataLoader pre-start ──────────────────────────────────
-    # DataLoader workers are launched lazily on the first iter() call. We kick
-    # them off NOW so their parquet-loading startup overlaps with GPU warmup
-    # instead of counting against the first training step.
-    # Without this: GPU sits at 0% for 1–3 min while workers init → job
-    # termination risk on schedulers that monitor GPU utilisation.
     if n_workers > 0:
-        _pre_iter = iter(loader)   # triggers forkserver to fork workers
+        _pre_iter = iter(loader)
         print(f"[{_ts()}][rank {rank}] DataLoader workers launched (pre-start)", flush=True)
     else:
         _pre_iter = None
@@ -305,10 +313,6 @@ def train_one_rank(rank: int, world_size: int, cfg: dict) -> None:
 
     # ── Training loop ────────────────────────────────────────────────────────
     n_epochs = train_cfg["n_epochs"]
-    # max_steps_per_epoch caps how many batches we consume per epoch.
-    # The DataLoader shuffle (seeded by epoch via sampler.set_epoch) gives a
-    # fresh random subset each epoch, so the model sees different data every
-    # pass even though not all 26 M chunks are visited in one epoch.
     _max_spe = train_cfg.get("max_steps_per_epoch", None)
     steps_per_epoch = min(len(loader), _max_spe) if _max_spe else len(loader)
     total_steps = n_epochs * steps_per_epoch
@@ -319,8 +323,9 @@ def train_one_rank(rank: int, world_size: int, cfg: dict) -> None:
     log_every = train_cfg.get("log_every", 50)
     ckpt_every = train_cfg.get("ckpt_every_steps", 2000)
 
-    # Scheduled-noise exposure bias mitigation (final 20% of epochs)
-    ss_start_epoch = int(0.8 * n_epochs)
+    # Scheduled-noise exposure bias mitigation
+    _ss_frac = float(train_cfg.get("scheduled_sampling_start_frac", 0.8))
+    ss_start_epoch = int(_ss_frac * n_epochs)
     ss_p_max = float(train_cfg.get("scheduled_sampling_p_max", 0.3))
     ss_t_min = int(train_cfg.get("scheduled_sampling_t_min", 50))
     ss_t_max = int(train_cfg.get("scheduled_sampling_t_max", 200))
@@ -329,29 +334,39 @@ def train_one_rank(rank: int, world_size: int, cfg: dict) -> None:
     if main and not log_path.exists():
         log_path.write_text("step,epoch,lr,loss,n_skipped\n")
 
-    def _save(tag: str = "last"):
+    def _save(
+        tag: str = "last",
+        *,
+        next_epoch_index: Optional[int] = None,
+    ) -> None:
+        """Persist training state.
+
+        ``next_epoch_index`` — explicitly set resume position:
+          None → same as ``current_epoch`` (mid-epoch or still inside this epoch index).
+          e    → resume will execute ``range(e, n_epochs)`` (e == n_epochs means training done).
+        """
         if not main:
             return
+        ne = current_epoch if next_epoch_index is None else next_epoch_index
+        ne = max(0, min(int(ne), int(n_epochs)))
         sd = {
             "model": raw_net.state_dict(),
             "optim": optim.state_dict(),
             "ema":   ema.state_dict() if ema else None,
             "scaler": scaler.state_dict() if scaler else None,
-            "epoch": current_epoch,
+            "epoch": ne,
             "step":  global_step,
             "cfg":   cfg,
+            "ckpt_ver": _CKPT_VER,
         }
-        # Write to a temp file first, then rename — guarantees that a crash or
-        # SIGKILL mid-write never corrupts the last good checkpoint on disk.
         tmp = ckpt_dir / f"{tag}.tmp.pt"
         dst = ckpt_dir / f"{tag}.pt"
         try:
             torch.save(sd, tmp)
-            tmp.replace(dst)   # os.replace — atomic on POSIX when same filesystem
+            tmp.replace(dst)
         except Exception as e:
             print(f"[rank 0] WARNING: checkpoint save to {dst} failed: {e}", flush=True)
 
-    # ── Graceful-stop signal handling ────────────────────────────────────────
     _stop_requested = threading.Event()
 
     def _signal_handler(signum, frame):
@@ -361,9 +376,6 @@ def train_one_rank(rank: int, world_size: int, cfg: dict) -> None:
     signal.signal(signal.SIGUSR1, _signal_handler)
     signal.signal(signal.SIGUSR2, _signal_handler)
 
-    # ── Heartbeat thread ──────────────────────────────────────────────────────
-    # Prints a "still alive" line every 60 s from every rank so the user can
-    # confirm both GPUs are active even during silent torch.compile warmup.
     _hb_stop = threading.Event()
 
     def _heartbeat():
@@ -382,216 +394,213 @@ def train_one_rank(rank: int, world_size: int, cfg: dict) -> None:
 
     n_skipped_total = 0
     t_start = time.time()
-    current_epoch = start_epoch
+    steps_at_run_start = global_step   # for correct rate/ETA after checkpoint resume
+    current_epoch = max(0, start_epoch - 1)
     last_loss = float("nan")
+    ran_out_of_epochs_to_train = start_epoch >= n_epochs
+    completed_every_planned_epoch = ran_out_of_epochs_to_train
+
     try:
-        for current_epoch in range(start_epoch, n_epochs):
-            if is_ddp and sampler is not None:
-                sampler.set_epoch(current_epoch)
-            net.train()
-
-            # Scheduled-noise probability ramps 0 → ss_p_max in last 20%
-            if current_epoch >= ss_start_epoch:
-                ss_p = ss_p_max * (current_epoch - ss_start_epoch + 1) / max(1, n_epochs - ss_start_epoch)
-            else:
-                ss_p = 0.0
-
-            # Print epoch start from ALL ranks so user sees both GPUs entering.
-            free, total = torch.cuda.mem_get_info(rank)
-            used_gb = (total - free) / 1024 ** 3
+        if ran_out_of_epochs_to_train and main:
             print(
-                f"[{_ts()}][rank {rank}] ── epoch {current_epoch} started "
-                f"| steps_this_epoch={steps_per_epoch:,} "
-                f"| GPU {rank}: {used_gb:.1f}/{total/1024**3:.1f} GB used",
+                f"[{_ts()}][rank {rank}] start_epoch {start_epoch} >= n_epochs {n_epochs}; "
+                f"nothing left to train (delete/rename checkpoints or raise n_epochs to continue).",
                 flush=True,
             )
 
-            epoch_stop = False
-            first_batch_done = False
-            for _epoch_step, batch in enumerate(loader):
-                # Both DDP ranks hit this at the same _epoch_step → no desync.
-                if _max_spe is not None and _epoch_step >= _max_spe:
-                    break
-                ctx        = batch["ctx"].to(device, non_blocking=True)         # (B, n_ch, W_ctx)
-                future_aux = batch["future_aux"].to(device, non_blocking=True)  # (B, 3, W_pred)
-                target     = batch["target"].to(device, non_blocking=True)      # (B, 1, W_pred)
-                pred_mask  = batch["pred_mask"].to(device, non_blocking=True)   # (B, W_pred)
-                cond       = batch["cond"].to(device, non_blocking=True)        # (B, 24)
-                B = ctx.size(0)
+        if not ran_out_of_epochs_to_train:
+            for current_epoch in range(start_epoch, n_epochs):
+                if is_ddp and sampler is not None:
+                    sampler.set_epoch(current_epoch)
+                net.train()
 
-                # LR schedule (update before forward so step 0 uses warmup=0 lr)
-                for pg in optim.param_groups:
-                    pg["lr"] = train_cfg["lr"] * _lr_factor(global_step, warmup, total_steps)
-
-                if device.type == "cuda":
-                    cm = torch.amp.autocast(device_type="cuda", dtype=amp_dtype)
+                if current_epoch >= ss_start_epoch:
+                    ss_p = ss_p_max * (current_epoch - ss_start_epoch + 1) / max(1, n_epochs - ss_start_epoch)
                 else:
-                    cm = torch.amp.autocast(device_type="cpu", enabled=False)
+                    ss_p = 0.0
 
-                # ── OOM-safe forward + backward ──────────────────────────────
-                batch_ok = True
-                try:
-                    # Sample diffusion timestep + noise
-                    t = torch.randint(0, sched.T, (B,), device=device)
-                    noise = torch.randn_like(target)
-                    x_t = sched.q_sample(target, t, noise)
-                    v_target = sched.get_v(target, t, noise)
+                free, total = torch.cuda.mem_get_info(rank)
+                used_gb = (total - free) / 1024 ** 3
+                print(
+                    f"[{_ts()}][rank {rank}] ── epoch {current_epoch} started "
+                    f"| steps_this_epoch={steps_per_epoch:,} "
+                    f"| GPU {rank}: {used_gb:.1f}/{total/1024**3:.1f} GB used",
+                    flush=True,
+                )
 
-                    # CFG dropout
-                    cond_drop = torch.rand(B, device=device) < cfg_dropout_p
+                epoch_stop = False
+                first_batch_done = False
+                for _epoch_step, batch in enumerate(loader):
+                    if _max_spe is not None and _epoch_step >= _max_spe:
+                        break
+                    ctx        = batch["ctx"].to(device, non_blocking=True)
+                    future_aux = batch["future_aux"].to(device, non_blocking=True)
+                    target     = batch["target"].to(device, non_blocking=True)
+                    pred_mask  = batch["pred_mask"].to(device, non_blocking=True)
+                    cond       = batch["cond"].to(device, non_blocking=True)
+                    B = ctx.size(0)
 
-                    # Scheduled-noise exposure-bias mitigation
-                    if ss_p > 0:
-                        do_ss = torch.rand(B, device=device) < ss_p
-                        if do_ss.any():
-                            ss_t = torch.randint(ss_t_min, ss_t_max, (B,), device=device)
-                            ctx_power = ctx[:, 3:4, :]
-                            ctx_power_noisy = sched.q_sample(
-                                ctx_power, ss_t, torch.randn_like(ctx_power)
-                            )
-                            ctx = ctx.clone()
-                            ctx[:, 3:4, :] = torch.where(
-                                do_ss[:, None, None], ctx_power_noisy, ctx_power
-                            )
+                    for pg in optim.param_groups:
+                        pg["lr"] = train_cfg["lr"] * _lr_factor(global_step, warmup, total_steps)
 
-                    with cm:
-                        v_pred = net(ctx, future_aux, x_t, t, cond, cond_drop_mask=cond_drop)
-                        sq = (v_pred - v_target) ** 2                        # (B, 1, W_pred)
-                        sq = sq.squeeze(1) * pred_mask                        # (B, W_pred)
-                        valid = pred_mask.sum(dim=1).clamp_min(1.0)           # (B,)
-                        per_sample_loss = sq.sum(dim=1) / valid               # (B,)
-
-                    # Outlier guard: ZERO OUT bad per-sample losses instead of
-                    # skipping the whole batch. Each rank sees different data, so
-                    # independently skipping backward desynchronises the DDP
-                    # gradient all_reduce → NCCL timeout after 30 min.
-                    bad_mask = ~torch.isfinite(per_sample_loss) | (per_sample_loss > loss_skip_thr)
-                    if bad_mask.any():
-                        n_skipped_total += int(bad_mask.sum().item())
-                        per_sample_loss = per_sample_loss.masked_fill(bad_mask, 0.0)
-                    loss = per_sample_loss.mean()
-
-                    # Coordinate NaN/Inf check across ALL DDP ranks. If ANY rank
-                    # ends up with a still-NaN loss (e.g. ALL samples were bad),
-                    # every rank skips backward together — the only DDP-safe way
-                    # to avoid a one-sided gradient all_reduce that would hang.
-                    nan_t = torch.tensor(0 if torch.isfinite(loss) else 1,
-                                         device=device, dtype=torch.int32)
-                    if is_ddp:
-                        dist.all_reduce(nan_t, op=dist.ReduceOp.MAX)
-
-                    if nan_t.item():
-                        optim.zero_grad(set_to_none=True)
-                        batch_ok = False
+                    if device.type == "cuda":
+                        cm = torch.amp.autocast(device_type="cuda", dtype=amp_dtype)
                     else:
-                        # Backward + optimizer step (all ranks participate — DDP-safe)
-                        optim.zero_grad(set_to_none=True)
-                        if scaler is not None:
-                            scaler.scale(loss).backward()
-                            scaler.unscale_(optim)
-                            torch.nn.utils.clip_grad_norm_(raw_net.parameters(), grad_clip)
-                            scaler.step(optim)
-                            scaler.update()
+                        cm = torch.amp.autocast(device_type="cpu", enabled=False)
+
+                    batch_ok = True
+                    try:
+                        t = torch.randint(0, sched.T, (B,), device=device)
+                        noise = torch.randn_like(target)
+                        x_t = sched.q_sample(target, t, noise)
+                        v_target = sched.get_v(target, t, noise)
+
+                        cond_drop = torch.rand(B, device=device) < cfg_dropout_p
+
+                        if ss_p > 0:
+                            do_ss = torch.rand(B, device=device) < ss_p
+                            if do_ss.any():
+                                ss_t = torch.randint(ss_t_min, ss_t_max, (B,), device=device)
+                                ctx_power = ctx[:, 3:4, :]
+                                ctx_power_noisy = sched.q_sample(
+                                    ctx_power, ss_t, torch.randn_like(ctx_power)
+                                )
+                                ctx = ctx.clone()
+                                ctx[:, 3:4, :] = torch.where(
+                                    do_ss[:, None, None], ctx_power_noisy, ctx_power
+                                )
+
+                        with cm:
+                            v_pred = net(ctx, future_aux, x_t, t, cond, cond_drop_mask=cond_drop)
+                            sq = (v_pred - v_target) ** 2
+                            sq = sq.squeeze(1) * pred_mask
+                            valid = pred_mask.sum(dim=1).clamp_min(1.0)
+                            per_sample_loss = sq.sum(dim=1) / valid
+
+                        bad_mask = ~torch.isfinite(per_sample_loss) | (per_sample_loss > loss_skip_thr)
+                        if bad_mask.any():
+                            n_skipped_total += int(bad_mask.sum().item())
+                            per_sample_loss = per_sample_loss.masked_fill(bad_mask, 0.0)
+                        loss = per_sample_loss.mean()
+
+                        nan_t = torch.tensor(0 if torch.isfinite(loss) else 1,
+                                             device=device, dtype=torch.int32)
+                        if is_ddp:
+                            dist.all_reduce(nan_t, op=dist.ReduceOp.MAX)
+
+                        if nan_t.item():
+                            optim.zero_grad(set_to_none=True)
+                            batch_ok = False
                         else:
-                            loss.backward()
-                            torch.nn.utils.clip_grad_norm_(raw_net.parameters(), grad_clip)
-                            optim.step()
+                            optim.zero_grad(set_to_none=True)
+                            if scaler is not None:
+                                scaler.scale(loss).backward()
+                                scaler.unscale_(optim)
+                                torch.nn.utils.clip_grad_norm_(raw_net.parameters(), grad_clip)
+                                scaler.step(optim)
+                                scaler.update()
+                            else:
+                                loss.backward()
+                                torch.nn.utils.clip_grad_norm_(raw_net.parameters(), grad_clip)
+                                optim.step()
 
-                        if ema is not None:
-                            ema.update(raw_net)
+                            if ema is not None:
+                                ema.update(raw_net)
 
-                        last_loss = loss.item()
+                            last_loss = loss.item()
 
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
-                    optim.zero_grad(set_to_none=True)
-                    n_skipped_total += 1
-                    batch_ok = False
-                    if main:
-                        print(f"[rank {rank}] CUDA OOM at step {global_step} — skipping batch, cache cleared", flush=True)
-                except Exception as exc:
-                    optim.zero_grad(set_to_none=True)
-                    n_skipped_total += 1
-                    batch_ok = False
-                    if main:
-                        print(f"[rank {rank}] step {global_step} error ({type(exc).__name__}): {exc}", flush=True)
-
-                global_step += 1
-
-                # ── First completed batch announcement (all ranks) ────────────
-                if batch_ok and not first_batch_done:
-                    first_batch_done = True
-                    free, total = torch.cuda.mem_get_info(rank)
-                    used_gb = (total - free) / 1024 ** 3
-                    print(
-                        f"[{_ts()}][rank {rank}] ✓ first batch done "
-                        f"(torch.compile warmup complete) "
-                        f"| GPU {rank}: {used_gb:.1f}/{total/1024**3:.1f} GB used",
-                        flush=True,
-                    )
-
-                # ── Stop-signal check (all ranks agree via all_reduce) ────────
-                # MUST run on ALL ranks regardless of batch_ok. If placed after
-                # the batch_ok `continue`, a rank that skips a bad batch would
-                # miss this all_reduce while the other rank enters it → hang.
-                if global_step % log_every == 0:
-                    stop_t = torch.tensor(
-                        1 if _stop_requested.is_set() else 0,
-                        device=device, dtype=torch.int32,
-                    )
-                    if is_ddp:
-                        dist.all_reduce(stop_t, op=dist.ReduceOp.MAX)
-                    if stop_t.item():
+                    except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
+                        optim.zero_grad(set_to_none=True)
+                        n_skipped_total += 1
+                        batch_ok = False
                         if main:
-                            print(f"[{_ts()}][rank 0] stop signal received — saving checkpoint and exiting", flush=True)
-                            _save("last")
-                        epoch_stop = True
-                        break  # exit batch loop; finally will clean up
+                            print(f"[rank {rank}] CUDA OOM at step {global_step} — skipping batch, cache cleared", flush=True)
+                    except Exception as exc:
+                        optim.zero_grad(set_to_none=True)
+                        n_skipped_total += 1
+                        batch_ok = False
+                        if main:
+                            print(f"[rank {rank}] step {global_step} error ({type(exc).__name__}): {exc}", flush=True)
 
-                if not batch_ok:
-                    continue  # skip logging and checkpoint for bad steps
+                    global_step += 1
 
-                # ── Logging (rank 0 only) ─────────────────────────────────────
-                if main and global_step % log_every == 0:
-                    cur_lr = optim.param_groups[0]["lr"]
-                    elapsed = time.time() - t_start
-                    rate = global_step / max(1.0, elapsed)
-                    eta_h = (total_steps - global_step) / max(1.0, rate) / 3600.0
-                    free, total_mem = torch.cuda.mem_get_info(rank)
-                    used_gb = (total_mem - free) / 1024 ** 3
+                    if batch_ok and not first_batch_done:
+                        first_batch_done = True
+                        free, total = torch.cuda.mem_get_info(rank)
+                        used_gb = (total - free) / 1024 ** 3
+                        print(
+                            f"[{_ts()}][rank {rank}] ✓ first batch done "
+                            f"(torch.compile warmup complete) "
+                            f"| GPU {rank}: {used_gb:.1f}/{total/1024**3:.1f} GB used",
+                            flush=True,
+                        )
+
+                    if global_step % log_every == 0:
+                        stop_t = torch.tensor(
+                            1 if _stop_requested.is_set() else 0,
+                            device=device, dtype=torch.int32,
+                        )
+                        if is_ddp:
+                            dist.all_reduce(stop_t, op=dist.ReduceOp.MAX)
+                        if stop_t.item():
+                            if main:
+                                print(f"[{_ts()}][rank 0] stop signal received — saving checkpoint and exiting", flush=True)
+                                _save("last")
+                            epoch_stop = True
+                            break
+
+                    if not batch_ok:
+                        continue
+
+                    if main and global_step % log_every == 0:
+                        cur_lr = optim.param_groups[0]["lr"]
+                        elapsed = time.time() - t_start
+                        steps_this_run = global_step - steps_at_run_start
+                        rate = steps_this_run / max(1.0, elapsed)
+                        eta_h = (total_steps - global_step) / max(1.0, rate) / 3600.0
+                        free, total_mem = torch.cuda.mem_get_info(rank)
+                        used_gb = (total_mem - free) / 1024 ** 3
+                        print(
+                            f"[{_ts()}] step {global_step}/{total_steps} ep {current_epoch} "
+                            f"lr {cur_lr:.2e} loss {last_loss:.4f} "
+                            f"skipped {n_skipped_total} rate {rate:.1f} steps/s "
+                            f"eta {eta_h:.1f}h ss_p {ss_p:.2f} "
+                            f"GPU0: {used_gb:.1f}GB",
+                            flush=True,
+                        )
+                        with open(log_path, "a") as f:
+                            f.write(f"{global_step},{current_epoch},{cur_lr},{last_loss},{n_skipped_total}\n")
+
+                    if main and global_step % ckpt_every == 0:
+                        _save("last")
+
+                if main and not epoch_stop:
+                    _save("last", next_epoch_index=min(current_epoch + 1, n_epochs))
                     print(
-                        f"[{_ts()}] step {global_step}/{total_steps} ep {current_epoch} "
-                        f"lr {cur_lr:.2e} loss {last_loss:.4f} "
-                        f"skipped {n_skipped_total} rate {rate:.1f} steps/s "
-                        f"eta {eta_h:.1f}h ss_p {ss_p:.2f} "
-                        f"GPU0: {used_gb:.1f}GB",
+                        f"[{_ts()}][rank 0] epoch {current_epoch} done at step {global_step}",
                         flush=True,
                     )
-                    with open(log_path, "a") as f:
-                        f.write(f"{global_step},{current_epoch},{cur_lr},{last_loss},{n_skipped_total}\n")
 
-                # ── Periodic checkpoint ───────────────────────────────────────
-                if main and global_step % ckpt_every == 0:
-                    _save("last")
+                if epoch_stop:
+                    break
 
-            # Epoch end
-            if main and not epoch_stop:
-                _save("last")
-                print(f"[{_ts()}][rank 0] epoch {current_epoch} done at step {global_step}", flush=True)
-
-            if epoch_stop:
-                break  # exit epoch loop
+            else:
+                # ``for`` finished without ``break`` — every epoch index in range ran to completion.
+                completed_every_planned_epoch = True
 
     except KeyboardInterrupt:
         if main:
             print(f"[{_ts()}][rank 0] KeyboardInterrupt — saving checkpoint and exiting", flush=True)
             _save("last")
     finally:
-        _hb_stop.set()   # stop heartbeat thread before cleanup
+        _hb_stop.set()
         if main:
-            _save("final")
+            fin_next = (
+                n_epochs if completed_every_planned_epoch else None
+            )
+            _save("final", next_epoch_index=fin_next)
             if ema is not None:
-                # Save EMA-only checkpoint for inference convenience
                 try:
                     torch.save({"ema": ema.state_dict(), "cfg": cfg},
                                ckpt_dir / "ema.pt")
@@ -604,9 +613,6 @@ def train_one_rank(rank: int, world_size: int, cfg: dict) -> None:
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 def run(cfg: dict) -> int:
-    # Raise the OS file-descriptor limit before spawning workers.
-    # DataLoader pin_memory + mmap workers each consume fds; the default soft
-    # limit (1024) is far too low for 16 workers × prefetch=4 × mmap cache.
     import resource as _resource
     _soft, _hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
     _target = min(65536, _hard)
@@ -614,23 +620,14 @@ def run(cfg: dict) -> int:
         _resource.setrlimit(_resource.RLIMIT_NOFILE, (_target, _hard))
         print(f"Raised fd limit: {_soft} → {_target}")
 
-    # MKL ships with INTEL threading by default, which is incompatible with
-    # libgomp (GNU OpenMP) used by PyTorch on Linux. Switch to GNU threading
-    # before spawning so all child processes inherit the correct setting.
     os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
 
-    # Persist torch.compile / Inductor kernel cache to NFS scratch so it
-    # survives across SLURM jobs and different compute nodes.  On a cache hit
-    # the compile warmup drops from ~15 min to ~30 s (CUDA context init only).
     _proj_root = Path(__file__).resolve().parent.parent.parent
     _cache_dir = _proj_root / ".torch_compile_cache"
     _cache_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(_cache_dir))
     os.environ.setdefault("TORCH_COMPILE_DEBUG", "0")  # suppress debug dumps
 
-    # Pick a free port once here, before spawning. All worker processes inherit
-    # the environment and will agree on this port. Using setdefault lets an
-    # externally set MASTER_PORT (e.g. from a SLURM launcher) take precedence.
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     if "MASTER_PORT" not in os.environ:
         os.environ["MASTER_PORT"] = str(_find_free_port())
