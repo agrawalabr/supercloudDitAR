@@ -251,33 +251,55 @@ def metrics(real: np.ndarray, fake: np.ndarray) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # Plotting
 # ─────────────────────────────────────────────────────────────────────────────
-def plot_samples_from_disk(synth_dir: Path, test_jobs: pd.DataFrame, log_mean_pwr: float, log_std_pwr: float, n_samples: int = 6, save_path: Optional[Path] = None) -> None:
-    """Plot real vs generated power traces using saved .npy files from synth_dir.
+def _pearson_real_gen_z(real_z: np.ndarray, gen_z: np.ndarray) -> float:
+    if len(real_z) == 0 or real_z.std() <= 1e-8 or gen_z.std() <= 1e-8:
+        return float("nan")
+    return float(np.corrcoef(real_z.astype(np.float64), gen_z.astype(np.float64))[0, 1])
 
-    Picks n_samples jobs spread across the duration range so the figure covers
-    short, medium, and long jobs rather than clustering at one end.
-    """
-    synth_dir = Path(synth_dir)
-    if save_path is None:
-        save_path = synth_dir.parent / "samples.png"
 
-    # Keep only rows for which a generation exists on disk
-    job_ids = test_jobs["job_id"].astype(str)
-    mask = job_ids.apply(lambda jid: (synth_dir / f"{jid}.npy").exists())
-    available = test_jobs[mask].copy()
-    if available.empty:
-        print(f"No generations found in {synth_dir} — nothing to plot.")
+def _attach_pearson_r(available: pd.DataFrame, synth_dir: Path) -> pd.DataFrame:
+    """Add pearson_r per row via summary.csv merge, or compute from NPY+synth."""
+    out = available.copy()
+    summary_path = synth_dir.parent / "summary.csv"
+    if summary_path.is_file():
+        sdf = pd.read_csv(summary_path)
+        sdf["job_id"] = sdf["job_id"].astype(str)
+        out = out.merge(sdf[["job_id", "pearson_r"]], on="job_id", how="left")
+    else:
+        out["pearson_r"] = np.nan
+
+    for i in range(len(out)):
+        if pd.notna(out["pearson_r"].iloc[i]):
+            continue
+        row = out.iloc[i]
+        jid = str(row["job_id"])
+        try:
+            arr = np.load(row["npy_path"], mmap_mode="r")
+            gen_z = np.load(synth_dir / f"{jid}.npy").astype(np.float32)
+        except Exception:
+            out.iat[i, out.columns.get_loc("pearson_r")] = np.nan
+            continue
+        real_z = np.asarray(arr[3, : len(gen_z)], dtype=np.float32)
+        out.iat[i, out.columns.get_loc("pearson_r")] = _pearson_real_gen_z(real_z, gen_z)
+    return out
+
+
+def _write_samples_figure(
+    pick_rows: pd.DataFrame,
+    synth_dir: Path,
+    log_mean_pwr: float,
+    log_std_pwr: float,
+    save_path: Path,
+    *,
+    panel_title: str,
+) -> None:
+    n = len(pick_rows)
+    if n == 0:
+        print(f"  Skip empty panel {save_path.name!r} ({panel_title})")
         return
 
-    # Sort by trace duration so picks span the full range
-    if "duration_sec" in available.columns:
-        available = available.sort_values("duration_sec").reset_index(drop=True)
-    pick_rows = available.iloc[
-        np.linspace(0, len(available) - 1, min(n_samples, len(available)), dtype=int)
-    ]
-
-    fig, axes = plt.subplots(len(pick_rows), 1, figsize=(15, 2.5 * len(pick_rows)))
-    if len(pick_rows) == 1:
+    fig, axes = plt.subplots(n, 1, figsize=(15, 2.5 * n))
+    if n == 1:
         axes = [axes]
 
     for ax, (_, row) in zip(axes, pick_rows.iterrows()):
@@ -285,7 +307,7 @@ def plot_samples_from_disk(synth_dir: Path, test_jobs: pd.DataFrame, log_mean_pw
         nodes_req = int(row["nodes_req"]) if "nodes_req" in row.index else 1
 
         try:
-            arr   = np.load(row["npy_path"], mmap_mode="r")   # (4, L)
+            arr = np.load(row["npy_path"], mmap_mode="r")
             gen_z = np.load(synth_dir / f"{jid}.npy").astype(np.float32)
         except Exception as exc:
             print(f"  Skip {jid}: {exc}")
@@ -294,19 +316,19 @@ def plot_samples_from_disk(synth_dir: Path, test_jobs: pd.DataFrame, log_mean_pw
 
         real_z = np.asarray(arr[3, : len(gen_z)], dtype=np.float32)
         real_W = denormalize_power(real_z, log_mean_pwr, log_std_pwr)
-        gen_W  = denormalize_power(gen_z,  log_mean_pwr, log_std_pwr)
+        gen_W = denormalize_power(gen_z, log_mean_pwr, log_std_pwr)
 
-        if real_z.std() > 1e-8 and gen_z.std() > 1e-8:
-            pr = float(np.corrcoef(real_z, gen_z)[0, 1])
-        else:
-            pr = 0.0
+        pr_el = row["pearson_r"] if "pearson_r" in row.index else float("nan")
+        pr = float(pr_el) if pd.notna(pr_el) else float("nan")
+        if not math.isfinite(pr):
+            pr = _pearson_real_gen_z(real_z, gen_z)
 
         dur_min = len(gen_z) * 0.103 / 60.0
-        ax.plot(real_W, label="Real",      lw=0.6, alpha=0.85)
-        ax.plot(gen_W,  label="Generated", lw=0.6, alpha=0.85)
+        ax.plot(real_W, label="Real", lw=0.6, alpha=0.85)
+        ax.plot(gen_W, label="Generated", lw=0.6, alpha=0.85)
         ax.set_title(
             f"job={jid}  nodes={nodes_req}  dur={dur_min:.1f} min  "
-            f"pearson_r={pr:+.3f}  "
+            f"pearson_r={float(pr):+.3f}  "
             f"real(μ/max)={real_W.mean():.0f}/{real_W.max():.0f} W  "
             f"gen(μ/max)={gen_W.mean():.0f}/{gen_W.max():.0f} W",
             fontsize=9,
@@ -316,14 +338,80 @@ def plot_samples_from_disk(synth_dir: Path, test_jobs: pd.DataFrame, log_mean_pw
         ax.grid(alpha=0.3)
 
     axes[-1].set_xlabel("step (0..L-1)")
-    fig.suptitle(
-        "Real vs Generated GPU Power Traces — DiT v5 Test Set",
-        fontsize=11, y=1.0,
-    )
+    fig.suptitle(panel_title + " — DiT v5 Test Set", fontsize=11, y=1.0)
     plt.tight_layout()
     plt.savefig(str(save_path), dpi=120, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved plot → {save_path}")
+
+
+def plot_samples_from_disk(
+    synth_dir: Path,
+    test_jobs: pd.DataFrame,
+    log_mean_pwr: float,
+    log_std_pwr: float,
+    n_samples: int = 6,
+    save_path: Optional[Path] = None,
+    *,
+    seed: int = 42,
+) -> None:
+    """Plot real vs generated power traces using saved synth .npy files.
+
+    Writes three figures next to ``save_path``'s stem: random *n_samples*, highest
+    Pearson *r* (*best* synthetic match to real), and lowest Pearson *r* (*worst*).
+    """
+    synth_dir = Path(synth_dir)
+    if save_path is None:
+        save_path = synth_dir.parent / "samples.png"
+    save_path = Path(save_path)
+    out_dir = save_path.parent
+    stem = save_path.stem
+
+    job_ids = test_jobs["job_id"].astype(str)
+    mask = job_ids.apply(lambda jid: (synth_dir / f"{jid}.npy").exists())
+    available = test_jobs[mask].copy().reset_index(drop=True)
+    if available.empty:
+        print(f"No generations found in {synth_dir} — nothing to plot.")
+        return
+
+    k = min(n_samples, len(available))
+    rng = np.random.default_rng(seed)
+
+    with_pe = _attach_pearson_r(available, synth_dir)
+    finite = with_pe.dropna(subset=["pearson_r"]).copy()
+    # Drop non-finite correlation (degenerate traces)
+    finite = finite[np.isfinite(finite["pearson_r"])].reset_index(drop=True)
+
+    idx_rand = rng.choice(len(available), size=k, replace=False)
+    pick_random = available.iloc[idx_rand].copy()
+    pick_random = pick_random.merge(with_pe[["job_id", "pearson_r"]], on="job_id", how="left")
+
+    pick_best = pd.DataFrame()
+    pick_worst = pd.DataFrame()
+    if len(finite) > 0:
+        kb = min(k, len(finite))
+        pick_best = finite.nlargest(kb, "pearson_r").reset_index(drop=True)
+        pick_worst = finite.nsmallest(kb, "pearson_r").reset_index(drop=True)
+    else:
+        print("Warning: no finite pearson_r for any job — skipping best/worst panels.")
+
+    _write_samples_figure(
+        pick_random, synth_dir, log_mean_pwr, log_std_pwr,
+        out_dir / f"{stem}_random.png",
+        panel_title=f"Random {k} samples — Real vs Generated GPU Power",
+    )
+    if len(pick_best):
+        _write_samples_figure(
+            pick_best, synth_dir, log_mean_pwr, log_std_pwr,
+            out_dir / f"{stem}_best.png",
+            panel_title=f"Top {len(pick_best)} by Pearson r — Real vs Generated GPU Power",
+        )
+    if len(pick_worst):
+        _write_samples_figure(
+            pick_worst, synth_dir, log_mean_pwr, log_std_pwr,
+            out_dir / f"{stem}_worst.png",
+            panel_title=f"Lowest {len(pick_worst)} by Pearson r — Real vs Generated GPU Power",
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -568,7 +656,15 @@ def run(cfg: dict, ckpt_dir: str = None) -> int:
     # ── Plot real vs generated samples ──
     n_plot = int(inf_cfg.get("plot_n_samples", 6))
     
-    plot_samples_from_disk(synth_dir=synth_dir,test_jobs=test_jobs, log_mean_pwr=log_mean_pwr, log_std_pwr=log_std_pwr, n_samples=n_plot, save_path=out_dir / "samples.png")
+    plot_samples_from_disk(
+        synth_dir=synth_dir,
+        test_jobs=test_jobs,
+        log_mean_pwr=log_mean_pwr,
+        log_std_pwr=log_std_pwr,
+        n_samples=n_plot,
+        save_path=out_dir / "samples.png",
+        seed=int(inf_cfg.get("seed", 42)),
+    )
 
     return 0
 
