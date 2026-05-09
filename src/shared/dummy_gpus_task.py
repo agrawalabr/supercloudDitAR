@@ -1,7 +1,7 @@
 import torch
 import time
 
-def dummy_gpus_hold():
+def dummy_gpus_task():
     """
     Keeps all available GPUs (e.g., 8 on LS140 nodes) busy until interrupted by the user.
     Each GPU will have its own busy loop.
@@ -42,4 +42,4 @@ def dummy_gpus_hold():
         t.join()
 
 if __name__ == "__main__":
-    keep_all_gpus_busy()
+    dummy_gpus_task()
