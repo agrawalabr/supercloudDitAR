@@ -3,6 +3,8 @@
 **Software artifact:** `supercloud-power` (Python package, version 0.1.0)  
 **Primary objective:** Build an end-to-end system that ingests SLURM scheduling metadata and time-aligned GPU telemetry, then trains a conditional diffusion model (**DiT-AR v5**) to synthesize **GPU power draw** trajectories under realistic operational constraints.
 
+**Research paper (DiT-AR v5):** The method—three patch streams, SLURM prefix token, joint diffusion-time + scheduler **AdaLN-Zero** conditioning, **v-prediction**, **CFG**, **DDIM** autoregressive windows—is the one implemented in `src/model/ditArV5.py` and summarized in **Appendix B** below. A companion IEEE-style manuscript draft (`RESEARCH_PAPER.md` in git history) and **Section 8** / `results/` report the same held-out protocol and figures (`results/ieee_figs/`, `results/samples_*.png`).
+
 This document serves as both the **technical report** for the project and the **operator guide** for reproducing the pipeline. Repository paths and hyperparameters may evolve; authoritative numeric settings live in `configs/*.yaml`.
 
 ---
@@ -48,10 +50,12 @@ Figure A‑1 (Appendix A) summarizes file-level dependencies between stages; Fig
 
 ### 3.1 Raw inputs (operator-supplied)
 
-The codebase does **not** download cluster data. Operators must place:
+By default the codebase does **not** download cluster data. Operators must place:
 
 - **`data/r/gpu/`** — Tree of CSV files conforming to `configs/gpuETL.yaml` (`glob_pattern`, `filename_pattern` extracting `job_id`).
 - **`data/r/slurm-log.csv`** — SLURM export with columns listed under `slurm_usecols` in `configs/slurmETL.yaml`.
+
+**Optional public dataset (MIT datacenter challenge):** `src/etl/download.py` lists and pulls **unsigned** objects from `s3://mit-supercloud-dataset/datacenter-challenge/202201/` into `./mit/` (parallel workers, skip-if-exists). It targets notebook-style use (`tqdm.notebook`) and requires **`boto3`** (and usually **`tqdm`**)—not wired into `pyproject.toml` optional extras today. Layout under `./mit/gpu/` must still match `gpuETL.yaml` if you point ingestion there.
 
 **Assumption:** `job_id` values are **consistent** across GPU filenames and SLURM `id_job` (after rename). SLURM rows without a corresponding GPU trace are **dropped** by an inner merge.
 
@@ -105,9 +109,9 @@ The model is a **diffusion transformer** with:
 - **v-prediction** objective with a **cosine** \(\beta\) schedule (`diffusion_T` steps).  
 - Optional **gradient checkpointing** (`use_checkpoint`) for memory-constrained GPUs.
 
-**Training** (`src/model/train.py`): masked MSE respecting job length (`pred_mask`), AdamW with warmup+cosine decay, gradient clipping, CFG-style conditioning dropout, **EMA** of weights, optional **scheduled sampling** noise injection on past power in late epochs, **mixed precision** (bf16 when supported), and **DDP** when multiple GPUs are visible. Checkpoints use atomic writes; **`ema.pt`** is preferred for downstream inference.
+**Training** (`src/model/train.py`): masked MSE respecting job length (`pred_mask`), AdamW with warmup+cosine decay, gradient clipping, CFG-style conditioning dropout (**`cfg_dropout_p`**), **EMA** of weights (**`ema_decay`** 0.9999 in `configs/v5.yaml`), optional **scheduled sampling** on the past-power context from a configured fraction of training through the end (**`scheduled_sampling_*`**), **mixed precision** (bf16 when supported), and **DDP** when multiple GPUs are visible. Shipped defaults emphasize a **~40k-job** corpus: **`batch_size` 256**, **`n_epochs` 160**, **`warmup_steps` 500**, **`weight_decay` 0.05**, **`dropout` 0.1**, **`use_checkpoint` false** (enable if VRAM-constrained). Checkpoints use atomic writes; **`ema.pt`** is preferred for downstream inference.
 
-**Inference** (`src/model/inference.py`): Loads **`ema.pt`** (fallback **`last.pt`**) and **`norm_stats.npz`** (power channel \(\log(1+x)\) mean/std). Reads **`test_jobs.parquet`** with optional **`subsample_n`** / **`subsample_stratify_cols`**. For each job: load truth **NPY** \((4,L)\), build SLURM **`cond`** from configured columns; **autoregressive sliding windows** — real future **aux** (3 channels), **generated** past **power** in context after window 0 — each window denoised with **DDIM** (`ddim_steps`, \(\eta=0\)) and **CFG** (`cfg_scale`). Writes **`{inference_dir}/synth/{job_id}.npy`** (generated power in **normalized / z-score space**, same convention as training channel 3). **Scores:** per-job **Pearson \(r\)**, **RMSE**, **MAE** on **denormalized watts** (`expm1(z\cdot\sigma+\mu)\)); logged columns **`job_id`**, **`length`**, **`duration_min`**; everything appended to **`summary.csv`**; stdout prints mean/median \(r\), **`frac>0.30`**, mean/median RMSE/MAE. **Plots:** **`samples.png`** (`plot_n_samples`, default 6) — jobs sampled across **`duration_sec`** when present; stacked panels of real vs generated power (W) with per-panel \(r\), duration, **`nodes_req`**, mean/max watts (matplotlib **Agg**). Optional **`trace_{job_id}.csv`** (`save_per_job_traces`): timestep, **`real_power_W`**, **`synthetic_power_W`**.
+**Inference** (`src/model/inference.py`): Loads **`ema.pt`** (fallback **`last.pt`**) and **`norm_stats.npz`** (power channel \(\log(1+x)\) mean/std). Reads **`test_jobs.parquet`** with optional **`subsample_n`** / **`subsample_stratify_cols`**. For each job: load truth **NPY** \((4,L)\), build SLURM **`cond`** from configured columns; **autoregressive sliding windows** — real future **aux** (3 channels), **generated** past **power** in context after window 0 — each window denoised with **DDIM** (`ddim_steps`, \(\eta=0\)) and **CFG** (`cfg_scale`, shipped **3.0** to strengthen scheduler conditioning). **`max_windows_per_job`** caps how many \(W_{\mathrm{pred}}\)-long windows are generated (default **`null`**: derive from **`duration_sec`** and \(\Delta t\)). **`skip_existing_synth`** (default **true**): reuse existing **`synth/{job_id}.npy`** but still refresh **`summary.csv`** metrics vs ground truth. Optional **`io_prefetch_workers`** (default **1** in code if omitted from YAML) overlaps NPY loads with GPU sampling. Writes **`{inference_dir}/synth/{job_id}.npy`** (generated power in **normalized / z-score space**, same convention as training channel 3). **Scores:** per-job **Pearson \(r\)**, **RMSE**, **MAE** on **denormalized watts** (`expm1(z\cdot\sigma+\mu)\)); logged columns **`job_id`**, **`length`**, **`duration_min`**; everything appended to **`summary.csv`**; stdout prints mean/median \(r\), **`frac>0.30`**, mean/median RMSE/MAE. **Plots:** **`samples.png`** (`plot_n_samples`, default **10** in `v5.yaml`) — jobs sampled across **`duration_sec`** when present; stacked panels of real vs generated power (W) with per-panel \(r\), duration, **`nodes_req`**, mean/max watts (matplotlib **Agg**). Optional **`trace_{job_id}.csv`** (`save_per_job_traces`): timestep, **`real_power_W`**, **`synthetic_power_W`**.
 
 Tensor shapes, token layout, and block connectivity are shown schematically in **Appendix B (Figure B‑1)**.
 
@@ -125,13 +129,15 @@ Tensor shapes, token layout, and block connectivity are shown schematically in *
 | SLURM ETL config | `configs/slurmETL.yaml` | Join + engineered features |
 | SeqETL config | `configs/seqETL.yaml` | NPY + chunk/job tables + stats |
 | Pipeline config | `configs/v5.yaml` | Model, train, inference, paths |
-| Dataset | `src/etl/chunk.py` | mmap-backed `PowerTraceDataset` |
+| Dataset | `src/shared/chunk.py` | mmap-backed `PowerTraceDataset` |
 | Training driver | `src/model/train.py` | DDP, AMP, logging, checkpoints |
-| Thin launcher | `src/model/main.py` | Loads `configs/v5.yaml`, invokes training |
 | Inference | `src/model/inference.py` | AR + DDIM + CFG generation; **`summary.csv`** metrics; **`samples.png`** |
-| HW probe | `src/shared/detect_hw.py` | CPU/GPU discovery |
-| Batch scripts | `scripts/train.sh`, `scripts/inference.sh` | Example SLURM submission |
-| Interactive helper | `scripts/terminal.sh` | tmux / Jupyter tunnel workflow |
+| HW probe (training) | `src/shared/detect_hw.py` | CPU/GPU discovery for workers / AMP |
+| HW probe (verbose) | `src/shared/node_info.py` | Per-GPU VRAM, `nvidia-smi` util, optional RAM via **psutil** |
+| Optional S3 fetch | `src/etl/download.py` | Unsigned pull from `mit-supercloud-dataset` challenge prefix |
+| Batch scripts | `bash/train.sh`, `bash/inference.sh` | Example SLURM submission |
+| Interactive helper | `bash/terminal.sh` | tmux / Jupyter tunnel workflow |
+| Cursor Canvas | `canvases/dit-v5-performance.canvas.tsx` | Optional IDE-side training / eval snapshot UI |
 
 **Exploratory artifacts:** `src/etl/model_power_traces_v4.ipynb`, root `app.ipynb` (not required for batch reproduction).
 
@@ -196,23 +202,24 @@ python src/model/train.py --config configs/v5.yaml
 python src/model/inference.py --config configs/v5.yaml --ckpt_dir output/v5/ckpt
 ```
 
-Alternative training entrypoint: `python src/model/main.py` (hardcoded `configs/v5.yaml`).
-
 ### 7.3 High-performance computing
 
-`scripts/train.sh` and `scripts/inference.sh` illustrate **sbatch** submission with site-specific accounts, partitions, and Python paths. Operators must adapt `#SBATCH` directives and filesystem locations. `scripts/terminal.sh` documents an interactive pattern (tmux, JupyterLab, SSH tunneling).
+`bash/train.sh` and `bash/inference.sh` illustrate **sbatch** submission with site-specific accounts, partitions, and Python paths. Operators must adapt `#SBATCH` directives and filesystem locations. `bash/terminal.sh` documents an interactive pattern (tmux, JupyterLab, SSH tunneling).
 
 ---
 
-## 8. Results reporting (operator-filled)
+## 8. Results (held-out test jobs, DiT-AR v5)
 
-This repository ships **code and configuration**, not fixed benchmark tables. After inference, populate a results subsection here or in an external document using:
+The DiT-AR v5 paper reports a **job-level** split (**10%** test, **seed 42**; see `configs/seqETL.yaml`) and per-job **Pearson \(r\)**, **RMSE**, **MAE** (watts) after inference. A complete run’s **`summary.csv`** lives under **`paths.inference_dir`** in `configs/v5.yaml` (default **`data/inference/v5/`**). This repository also archives a copy at **`results/summary.csv`** (**4,404** jobs, header + one row per job) with distributional figures suitable for a manuscript:
 
-- **`data/inference/<run>/summary.csv`** — per-job and aggregate statistics.  
-- **`samples.png`** — qualitative comparison plots.  
-- **`train_log.csv`** — training stability narrative.
+| Metric | Mean | Median |
+|--------|-----:|-------:|
+| Pearson \(r\) | **0.212** | **0.109** |
+| RMSE (W) | 309.0 | **20.9** |
+| MAE (W) | 262.6 | **15.0** |
+| Share of jobs with \(r > 0.30\) | — | **32.4%** |
 
-Recording the **Git commit hash**, **`configs/v5.yaml`** snapshot, and **dataset vintage** (export dates) is recommended for any publication or internal review.
+**Mean** RMSE/MAE are **tail-dominated** (a subset of long or high-power jobs); **medians** better reflect typical jobs. Publication-style plots: **`results/ieee_figs/`** (histograms of \(r\), \(\log_{10}\) RMSE/MAE, scatter \(r\) vs duration); qualitative **`results/samples_{best,random,worst}.png`** and **`results/samples.png`**. Recompute these after new training by re-running inference and your plotting pipeline; record the **Git commit**, **`configs/v5.yaml`**, **`norm_stats.npz`**, and **data vintage** for any derivative write-up.
 
 ---
 

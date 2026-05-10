@@ -1,7 +1,5 @@
-# Top-level v5 pipeline config — read by main.py
-#
-# Each stage (seqETL, train, inference) finds its config here.
-# main.py runs them in order; pass --skip_* flags to selectively skip stages.
+# Top-level v5 pipeline config — read by train.py and inference.py#
+# Sequence dimensions and slurm_feature_cols must stay aligned with seqETL.yaml.
 
 paths:
   # Stage configs

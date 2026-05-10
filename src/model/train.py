@@ -38,7 +38,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 # Local imports
 import src.model.ditArV5 as M
-import src.etl.chunk as cE
+import src.shared.chunk as cE
 import src.etl.seq as seqETL
 from src.shared.detect_hw import *
 
